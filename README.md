@@ -10,8 +10,8 @@
 
 ## Updates
 - We have released our [training script](https://github.com/cvlab-columbia/pix2gestalt?tab=readme-ov-file#training), [dataset](https://github.com/cvlab-columbia/pix2gestalt?tab=readme-ov-file#dataset), and [Gradio demo](https://github.com/cvlab-columbia/pix2gestalt?tab=readme-ov-file#inference-and-weights) with inference instructions.
-- Custom training & fine-tuning instructions coming soon. Beyond amodal perception, our repository can also be used to fine-tune Stable Diffusion in an image-conditioned manner with spatial prompts, such as binary masks.
-- Pretrained models are released on [Huggingface](https://huggingface.co/cvlab/pix2gestalt-weights), more details provided [here](https://github.com/cvlab-columbia/pix2gestalt#inference-and-weights).  
+- Pretrained models are released on [Huggingface](https://huggingface.co/cvlab/pix2gestalt-weights), more details provided [here](https://github.com/cvlab-columbia/pix2gestalt#inference-and-weights).
+- Beyond amodal perception, our repository can also be used to fine-tune Stable Diffusion in an image-conditioned manner with spatial prompts, such as binary masks.
 - pix2gestalt was accepted to CVPR 2024, available on [arXiv](https://arxiv.org/abs/2401.14398)!
 
 ##  Installation
