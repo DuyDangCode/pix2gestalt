@@ -95,13 +95,22 @@ log_info "--- Step 2/5: Installing Dependencies ---"
 
 pip install --upgrade pip setuptools wheel
 
+# Fix albumentations 0.4.3 wheel build issue on modern Python
+if [ -f "pix2gestalt/requirements.txt" ]; then
+    sed -i 's/albumentations==0.4.3/albumentations>=1.0.0/g' pix2gestalt/requirements.txt 2>/dev/null || true
+fi
+
+# Pre-install binary wheel for albumentations and opencv to avoid legacy source compilation
+log_info "Pre-installing binary wheels for albumentations and opencv..."
+pip install --prefer-binary "albumentations>=1.0.0" opencv-python
+
 # Install base requirements
 if [ -f "pix2gestalt/requirements.txt" ]; then
     log_info "Installing packages from pix2gestalt/requirements.txt..."
-    pip install -r pix2gestalt/requirements.txt || {
+    pip install --prefer-binary -r pix2gestalt/requirements.txt || {
         log_warn "Standard requirements install encountered issues, falling back to core dependencies..."
         pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
-        pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm
+        pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm "albumentations>=1.0.0"
     }
 fi
 
