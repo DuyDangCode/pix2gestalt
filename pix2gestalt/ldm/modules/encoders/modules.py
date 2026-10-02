@@ -362,9 +362,15 @@ class FrozenCLIPImageEmbedder(AbstractEncoder):
 
     def preprocess(self, x):
         # Expects inputs in the range -1, 1
-        x = kornia.geometry.resize(x, (224, 224),
-                                   interpolation='bicubic',align_corners=True,
-                                   antialias=self.antialias)
+        try:
+            x = kornia.geometry.resize(x, (224, 224),
+                                       interpolation='bicubic', align_corners=True,
+                                       antialias=self.antialias)
+        except Exception:
+            # Fallback for systems/architectures where bicubic CUDA kernel is unavailable
+            x_cpu = x.cpu().float()
+            x_resized = torch.nn.functional.interpolate(x_cpu, size=(224, 224), mode='bicubic', align_corners=True)
+            x = x_resized.to(x.device, dtype=x.dtype)
         x = (x + 1.) / 2.
         # renormalize according to clip
         x = kornia.enhance.normalize(x, self.mean, self.std)

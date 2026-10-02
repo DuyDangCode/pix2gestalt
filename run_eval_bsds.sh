@@ -36,56 +36,65 @@ echo -e "${BOLD}================================================================
 log_info "Working directory: ${PROJECT_ROOT}"
 
 # ==============================================================================
-# Step 1: Conda Environment Setup
+# Step 1: Python Environment Setup
 # ==============================================================================
-log_info "--- Step 1/5: Checking Conda Environment ---"
+log_info "--- Step 1/5: Checking Python Environment ---"
 
 CONDA_ENV_NAME="pix2gestalt"
 
-# Find Conda installation
-find_conda() {
-    if command -v conda &> /dev/null; then
-        echo "$(conda info --base 2>/dev/null)/etc/profile.d/conda.sh"
-    elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
-        echo "/opt/conda/etc/profile.d/conda.sh"
-    elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-        echo "$HOME/miniconda3/etc/profile.d/conda.sh"
-    elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-        echo "$HOME/anaconda3/etc/profile.d/conda.sh"
-    elif [ -f "/root/miniconda3/etc/profile.d/conda.sh" ]; then
-        echo "/root/miniconda3/etc/profile.d/conda.sh"
-    elif [ -f "$HOME/.conda/etc/profile.d/conda.sh" ]; then
-        echo "$HOME/.conda/etc/profile.d/conda.sh"
-    else
-        echo ""
-    fi
-}
-
-CONDA_SH="$(find_conda)"
-
-if [ -z "${CONDA_SH}" ] || [ ! -f "${CONDA_SH}" ]; then
-    log_warn "Conda not found in PATH or standard directories."
-    log_info "Installing Miniconda3 for automatic environment isolation..."
-    MINICONDA_INSTALLER="/tmp/miniconda.sh"
-    wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O "${MINICONDA_INSTALLER}"
-    bash "${MINICONDA_INSTALLER}" -b -p "$HOME/miniconda3"
-    rm -f "${MINICONDA_INSTALLER}"
-    CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
-fi
-
-log_info "Sourcing Conda from: ${CONDA_SH}"
-# shellcheck disable=SC1090
-source "${CONDA_SH}"
-
-# Check if conda environment exists
-if conda env list | grep -q "^${CONDA_ENV_NAME} "; then
-    log_info "Conda environment '${CONDA_ENV_NAME}' already exists. Activating..."
+# 1. First check if a pre-existing cloud virtual environment exists (e.g. RunPod / Vast.ai / venv)
+if [ -f "/venv/pix2gestalt/bin/activate" ]; then
+    log_info "Detected pre-configured cloud virtual environment at /venv/pix2gestalt. Activating..."
+    # shellcheck disable=SC1091
+    source "/venv/pix2gestalt/bin/activate"
+elif [ -n "${VIRTUAL_ENV}" ]; then
+    log_info "Using already active virtual environment: ${VIRTUAL_ENV}"
 else
-    log_info "Creating conda environment '${CONDA_ENV_NAME}' with Python 3.9..."
-    conda create -y -n "${CONDA_ENV_NAME}" python=3.9
+    # 2. Otherwise find or install Conda
+    find_conda() {
+        if command -v conda &> /dev/null; then
+            echo "$(conda info --base 2>/dev/null)/etc/profile.d/conda.sh"
+        elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+            echo "/opt/conda/etc/profile.d/conda.sh"
+        elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            echo "$HOME/miniconda3/etc/profile.d/conda.sh"
+        elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            echo "$HOME/anaconda3/etc/profile.d/conda.sh"
+        elif [ -f "/root/miniconda3/etc/profile.d/conda.sh" ]; then
+            echo "/root/miniconda3/etc/profile.d/conda.sh"
+        elif [ -f "$HOME/.conda/etc/profile.d/conda.sh" ]; then
+            echo "$HOME/.conda/etc/profile.d/conda.sh"
+        else
+            echo ""
+        fi
+    }
+
+    CONDA_SH="$(find_conda)"
+
+    if [ -z "${CONDA_SH}" ] || [ ! -f "${CONDA_SH}" ]; then
+        log_warn "Conda not found in PATH or standard directories."
+        log_info "Installing Miniconda3 for automatic environment isolation..."
+        MINICONDA_INSTALLER="/tmp/miniconda.sh"
+        wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O "${MINICONDA_INSTALLER}"
+        bash "${MINICONDA_INSTALLER}" -b -p "$HOME/miniconda3"
+        rm -f "${MINICONDA_INSTALLER}"
+        CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
+    fi
+
+    log_info "Sourcing Conda from: ${CONDA_SH}"
+    # shellcheck disable=SC1090
+    source "${CONDA_SH}"
+
+    if conda env list | grep -q "^${CONDA_ENV_NAME} "; then
+        log_info "Conda environment '${CONDA_ENV_NAME}' already exists. Activating..."
+    else
+        log_info "Creating conda environment '${CONDA_ENV_NAME}' with Python 3.9..."
+        conda create -y -n "${CONDA_ENV_NAME}" python=3.9
+    fi
+
+    conda activate "${CONDA_ENV_NAME}"
 fi
 
-conda activate "${CONDA_ENV_NAME}"
 log_success "Active Python: $(which python) ($(python --version))"
 
 # ==============================================================================
@@ -97,11 +106,49 @@ pip install --upgrade pip wheel
 # Critical: setuptools >= 82.0.0 removed pkg_resources, which breaks torchmetrics/pytorch_lightning
 pip install --prefer-binary "setuptools<80.0.0"
 
-# Fix legacy pinned versions in requirements.txt on modern Python
+# Fix legacy pinned versions in requirements.txt on modern Python and strip legacy cu113 torch
 if [ -f "pix2gestalt/requirements.txt" ]; then
     sed -i 's/albumentations==0.4.3/albumentations>=1.0.0/g' pix2gestalt/requirements.txt 2>/dev/null || true
     sed -i 's/imageio==2.9.0/imageio>=2.9.0/g' pix2gestalt/requirements.txt 2>/dev/null || true
     sed -i 's/imageio-ffmpeg==0.4.2/imageio-ffmpeg>=0.4.2/g' pix2gestalt/requirements.txt 2>/dev/null || true
+    sed -i '/--extra-index-url.*cu113/d' pix2gestalt/requirements.txt 2>/dev/null || true
+    sed -i '/torch==1.12.1/d' pix2gestalt/requirements.txt 2>/dev/null || true
+    sed -i '/torchvision==0.13.1/d' pix2gestalt/requirements.txt 2>/dev/null || true
+fi
+
+# Detect GPU architecture and install PyTorch with proper CUDA support upfront
+log_info "Verifying PyTorch CUDA compatibility on active GPU..."
+NEED_TORCH_UPGRADE=$(python -c "
+import sys
+try:
+    import torch
+    if not torch.cuda.is_available():
+        print('NO_CUDA')
+    else:
+        cap = torch.cuda.get_device_capability()
+        ver = torch.__version__
+        # sm_89 (RTX 40-series/Ada, L4) and sm_90 (Hopper) require PyTorch >= 2.0 (CUDA 12.1 / 11.8)
+        if (cap[0] > 8 or (cap[0] == 8 and cap[1] >= 9)) and ver.startswith('1.'):
+            print('UPGRADE')
+        else:
+            x = torch.zeros(1, 3, 224, 224, device='cuda')
+            y = torch.nn.functional.interpolate(x, size=(224, 224), mode='bicubic', align_corners=True)
+            torch.cuda.synchronize()
+            print('OK')
+except Exception:
+    print('UPGRADE')
+" 2>/dev/null || echo "UPGRADE")
+
+if [ "${NEED_TORCH_UPGRADE}" == "UPGRADE" ]; then
+    log_warn "Current PyTorch version lacks CUDA kernel images for this GPU (RTX 40-series/Ada sm_89 requires PyTorch 2.x)."
+    log_info "Automatically upgrading PyTorch to CUDA 12.1 build with native RTX 40-series support..."
+    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu121 || \
+    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu118
+    # Re-pin setuptools
+    pip install --prefer-binary "setuptools<80.0.0"
+    log_success "PyTorch successfully upgraded for modern GPU architecture."
+else
+    log_info "PyTorch CUDA compatibility verified (${NEED_TORCH_UPGRADE})."
 fi
 
 # Pre-install binary wheel for albumentations, opencv, and modern imageio to prevent conflicts
@@ -145,36 +192,6 @@ fi
 # Install evaluation support tools
 log_info "Installing evaluation utilities (pycocotools, gdown, etc.)..."
 pip install --prefer-binary pycocotools gdown pandas "imageio>=2.33.0" "setuptools<80.0.0" scikit-image > /dev/null 2>&1 || true
-
-# Verify CUDA kernel execution on the GPU to detect architecture mismatch (e.g. RTX 40-series sm_89 on torch 1.12 cu113)
-log_info "Verifying PyTorch CUDA kernel compatibility on active GPU..."
-CUDA_COMPATIBLE=$(python -c "
-import torch
-if not torch.cuda.is_available():
-    print('no_gpu')
-else:
-    try:
-        cap = torch.cuda.get_device_capability()
-        if (cap[0] > 8 or (cap[0] == 8 and cap[1] >= 9)) and '+cu113' in torch.__version__:
-            print('incompatible')
-        else:
-            x = torch.zeros(1, 3, 10, 10, device='cuda')
-            y = torch.nn.functional.interpolate(x, size=(20, 20), mode='bicubic', align_corners=False)
-            torch.cuda.synchronize()
-            print('ok')
-    except Exception as e:
-        print('incompatible')
-" 2>/dev/null || echo "incompatible")
-
-if [ "${CUDA_COMPATIBLE}" == "incompatible" ]; then
-    log_warn "Installed PyTorch binary lacks CUDA kernel images for this GPU (e.g. RTX 40-series / Ada / Hopper)."
-    log_info "Upgrading PyTorch to CUDA 12.1 build with native RTX 40-series / sm_89 support..."
-    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu121 || \
-    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu118
-    # Re-pin setuptools
-    pip install --prefer-binary "setuptools<80.0.0"
-    log_success "PyTorch successfully upgraded for modern GPU architecture."
-fi
 
 log_success "All dependencies are installed and verified."
 
