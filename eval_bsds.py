@@ -19,8 +19,34 @@ import time
 import warnings
 from typing import List, Dict, Any, Tuple, Optional
 
-# Suppress harmless torchvision C++ extension warning on systems with mismatched CUDA runtimes
+# Compatibility shim: setuptools >= 82.0.0 removed pkg_resources, which breaks
+# legacy pytorch_lightning 1.4.2 and torchmetrics 0.6.0 checkpoint unpickling.
+try:
+    import pkg_resources
+except ImportError:
+    try:
+        import importlib.metadata as _importlib_metadata
+    except ImportError:
+        import importlib_metadata as _importlib_metadata  # type: ignore
+    import types
+
+    class _DistributionNotFound(Exception):
+        pass
+
+    def _get_distribution(name):
+        try:
+            return _importlib_metadata.distribution(name)
+        except _importlib_metadata.PackageNotFoundError:
+            raise _DistributionNotFound(name)
+
+    _pkg = types.ModuleType("pkg_resources")
+    _pkg.DistributionNotFound = _DistributionNotFound
+    _pkg.get_distribution = _get_distribution
+    sys.modules["pkg_resources"] = _pkg
+
+# Suppress harmless warnings (torchvision C++ extension & new GPU architecture warnings)
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
+warnings.filterwarnings("ignore", message=".*is not compatible with the current PyTorch installation.*")
 
 import cv2
 import numpy as np
@@ -87,9 +113,9 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda") -> torch.
     print(f"[Model] Loading config from {config_path}")
     config = OmegaConf.load(config_path)
 
-    print(f"[Model] Loading weights from {ckpt_path} ({file_size / (1024**3):.2f} GB) to {device}...")
+    print(f"[Model] Loading weights from {ckpt_path} ({file_size / (1024**3):.2f} GB) to CPU first (saving VRAM)...")
     try:
-        pl_sd = torch.load(ckpt_path, map_location=device)
+        pl_sd = torch.load(ckpt_path, map_location="cpu")
     except Exception as e:
         if "PytorchStreamReader" in str(e) or "zip archive" in str(e):
             raise RuntimeError(
@@ -114,6 +140,13 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda") -> torch.
     if len(u) > 0:
         print(f"[Model] Unexpected keys: {len(u)}")
 
+    # Clean up checkpoint memory before allocating GPU memory
+    del pl_sd
+    del sd
+    import gc
+    gc.collect()
+
+    print(f"[Model] Transferring model to target device: {device}...")
     model.to(device)
     model.eval()
     print("[Model] Model successfully loaded and set to eval mode.")

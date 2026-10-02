@@ -93,7 +93,9 @@ log_success "Active Python: $(which python) ($(python --version))"
 # ==============================================================================
 log_info "--- Step 2/5: Installing Dependencies ---"
 
-pip install --upgrade pip setuptools wheel
+pip install --upgrade pip wheel
+# Critical: setuptools >= 82.0.0 removed pkg_resources, which breaks torchmetrics/pytorch_lightning
+pip install --prefer-binary "setuptools<80.0.0"
 
 # Fix legacy pinned versions in requirements.txt on modern Python
 if [ -f "pix2gestalt/requirements.txt" ]; then
@@ -104,7 +106,7 @@ fi
 
 # Pre-install binary wheel for albumentations, opencv, and modern imageio to prevent conflicts
 log_info "Pre-installing binary wheels for albumentations, opencv, and imageio..."
-pip install --prefer-binary "albumentations>=1.0.0" opencv-python "imageio>=2.33.0"
+pip install --prefer-binary "albumentations>=1.0.0" opencv-python "imageio>=2.33.0" "setuptools<80.0.0"
 
 # Install base requirements
 if [ -f "pix2gestalt/requirements.txt" ]; then
@@ -112,7 +114,7 @@ if [ -f "pix2gestalt/requirements.txt" ]; then
     pip install --prefer-binary -r pix2gestalt/requirements.txt || {
         log_warn "Standard requirements install encountered issues, falling back to core dependencies..."
         pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
-        pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm "albumentations>=1.0.0" "imageio>=2.33.0"
+        pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm "albumentations>=1.0.0" "imageio>=2.33.0" "setuptools<80.0.0"
     }
 fi
 
@@ -136,7 +138,7 @@ fi
 
 # Install evaluation support tools
 log_info "Installing evaluation utilities (pycocotools, gdown, etc.)..."
-pip install --prefer-binary pycocotools gdown pandas "imageio>=2.33.0" scikit-image > /dev/null 2>&1 || true
+pip install --prefer-binary pycocotools gdown pandas "imageio>=2.33.0" "setuptools<80.0.0" scikit-image > /dev/null 2>&1 || true
 
 log_success "All dependencies are installed and verified."
 
