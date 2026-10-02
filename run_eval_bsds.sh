@@ -146,6 +146,31 @@ fi
 log_info "Installing evaluation utilities (pycocotools, gdown, etc.)..."
 pip install --prefer-binary pycocotools gdown pandas "imageio>=2.33.0" "setuptools<80.0.0" scikit-image > /dev/null 2>&1 || true
 
+# Verify CUDA kernel execution on the GPU to detect architecture mismatch (e.g. RTX 40-series sm_89 on torch 1.12 cu113)
+log_info "Verifying PyTorch CUDA kernel compatibility on active GPU..."
+CUDA_COMPATIBLE=$(python -c "
+import torch
+if not torch.cuda.is_available():
+    print('no_gpu')
+else:
+    try:
+        x = torch.zeros(1, 3, 10, 10, device='cuda')
+        y = torch.nn.functional.interpolate(x, size=(20, 20), mode='bicubic', align_corners=False)
+        print('ok')
+    except Exception as e:
+        print('incompatible')
+" 2>/dev/null || echo "incompatible")
+
+if [ "${CUDA_COMPATIBLE}" == "incompatible" ]; then
+    log_warn "Installed PyTorch binary lacks CUDA kernel images for this GPU (e.g. RTX 40-series / Ada / Hopper)."
+    log_info "Upgrading PyTorch to CUDA 12.1 build with native RTX 40-series / sm_89 support..."
+    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu121 || \
+    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu118
+    # Re-pin setuptools
+    pip install --prefer-binary "setuptools<80.0.0"
+    log_success "PyTorch successfully upgraded for modern GPU architecture."
+fi
+
 log_success "All dependencies are installed and verified."
 
 # ==============================================================================

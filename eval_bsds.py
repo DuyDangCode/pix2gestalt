@@ -55,7 +55,10 @@ from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
-from torch import autocast
+try:
+    from torch.cuda.amp import autocast
+except ImportError:
+    from torch import autocast
 from contextlib import nullcontext
 
 # Ensure pix2gestalt package, submodules, taming-transformers, and CLIP are accessible in sys.path
