@@ -17,7 +17,10 @@ def load_model_from_config(config, ckpt, device, verbose=False):
     closure_device = device
 
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location=device)
+    try:
+        pl_sd = torch.load(ckpt, map_location=device, weights_only=False)
+    except TypeError:
+        pl_sd = torch.load(ckpt, map_location=device)
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]

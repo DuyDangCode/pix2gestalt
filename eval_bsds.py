@@ -51,6 +51,28 @@ warnings.filterwarnings("ignore", message=".*is not compatible with the current 
 import cv2
 import numpy as np
 import torch
+
+# In PyTorch 2.6+, weights_only changed default to True, breaking legacy PyTorch Lightning checkpoints.
+# Allowlist ModelCheckpoint and monkey-patch torch.load to default weights_only=False for legacy weights.
+try:
+    import pytorch_lightning.callbacks.model_checkpoint
+    if hasattr(torch.serialization, "add_safe_globals"):
+        torch.serialization.add_safe_globals([pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint])
+except Exception:
+    pass
+
+_orig_torch_load = torch.load
+
+def _safe_torch_load(*args, **kwargs):
+    if "weights_only" not in kwargs:
+        try:
+            return _orig_torch_load(*args, weights_only=False, **kwargs)
+        except TypeError:
+            pass
+    return _orig_torch_load(*args, **kwargs)
+
+torch.load = _safe_torch_load
+
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm
@@ -124,7 +146,10 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda") -> torch.
 
     print(f"[Model] Loading weights from {ckpt_path} ({file_size / (1024**3):.2f} GB) to CPU first (saving VRAM)...")
     try:
-        pl_sd = torch.load(ckpt_path, map_location="cpu")
+        try:
+            pl_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            pl_sd = torch.load(ckpt_path, map_location="cpu")
     except Exception as e:
         if "PytorchStreamReader" in str(e) or "zip archive" in str(e):
             raise RuntimeError(
