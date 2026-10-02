@@ -113,7 +113,7 @@ if [ -f "pix2gestalt/requirements.txt" ]; then
     log_info "Installing packages from pix2gestalt/requirements.txt..."
     pip install --prefer-binary -r pix2gestalt/requirements.txt || {
         log_warn "Standard requirements install encountered issues, falling back to core dependencies..."
-        pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
+        pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu121 || pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu118
         pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm "albumentations>=1.0.0" "imageio>=2.33.0" "setuptools<80.0.0"
     }
 fi
@@ -154,9 +154,14 @@ if not torch.cuda.is_available():
     print('no_gpu')
 else:
     try:
-        x = torch.zeros(1, 3, 10, 10, device='cuda')
-        y = torch.nn.functional.interpolate(x, size=(20, 20), mode='bicubic', align_corners=False)
-        print('ok')
+        cap = torch.cuda.get_device_capability()
+        if (cap[0] > 8 or (cap[0] == 8 and cap[1] >= 9)) and '+cu113' in torch.__version__:
+            print('incompatible')
+        else:
+            x = torch.zeros(1, 3, 10, 10, device='cuda')
+            y = torch.nn.functional.interpolate(x, size=(20, 20), mode='bicubic', align_corners=False)
+            torch.cuda.synchronize()
+            print('ok')
     except Exception as e:
         print('incompatible')
 " 2>/dev/null || echo "incompatible")
