@@ -58,13 +58,19 @@ from einops import rearrange
 from torch import autocast
 from contextlib import nullcontext
 
-# Ensure pix2gestalt package and submodules are accessible in sys.path
+# Ensure pix2gestalt package, submodules, taming-transformers, and CLIP are accessible in sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PIX2GESTALT_DIR = os.path.join(SCRIPT_DIR, "pix2gestalt")
-if PIX2GESTALT_DIR not in sys.path:
-    sys.path.insert(0, PIX2GESTALT_DIR)
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
+for path_cand in [
+    SCRIPT_DIR,
+    PIX2GESTALT_DIR,
+    os.path.join(SCRIPT_DIR, "taming-transformers"),
+    os.path.join(SCRIPT_DIR, "CLIP"),
+    os.path.join(PIX2GESTALT_DIR, "taming-transformers"),
+    os.path.join(PIX2GESTALT_DIR, "CLIP"),
+]:
+    if os.path.isdir(path_cand) and path_cand not in sys.path:
+        sys.path.insert(0, path_cand)
 
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.util import instantiate_from_config

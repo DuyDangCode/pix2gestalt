@@ -118,22 +118,28 @@ if [ -f "pix2gestalt/requirements.txt" ]; then
     }
 fi
 
-# Install taming-transformers if not present
-if [ ! -d "taming-transformers" ]; then
-    log_info "Cloning and installing CompVis/taming-transformers..."
-    git clone https://github.com/CompVis/taming-transformers.git
-    pip install -e taming-transformers/
+# Ensure taming-transformers is installed in current Python environment
+if ! python -c "import taming" 2>/dev/null; then
+    if [ ! -d "taming-transformers" ]; then
+        log_info "Cloning CompVis/taming-transformers..."
+        git clone https://github.com/CompVis/taming-transformers.git
+    fi
+    log_info "Installing taming-transformers into Python environment..."
+    pip install --prefer-binary -e taming-transformers/ || pip install --prefer-binary git+https://github.com/CompVis/taming-transformers.git
 else
-    log_info "taming-transformers already present."
+    log_info "taming module already verified in Python."
 fi
 
-# Install CLIP if not present
-if [ ! -d "CLIP" ]; then
-    log_info "Cloning and installing openai/CLIP..."
-    git clone https://github.com/openai/CLIP.git
-    pip install -e CLIP/
+# Ensure CLIP is installed in current Python environment
+if ! python -c "import clip" 2>/dev/null; then
+    if [ ! -d "CLIP" ]; then
+        log_info "Cloning openai/CLIP..."
+        git clone https://github.com/openai/CLIP.git
+    fi
+    log_info "Installing CLIP into Python environment..."
+    pip install --prefer-binary -e CLIP/ || pip install --prefer-binary git+https://github.com/openai/CLIP.git
 else
-    log_info "CLIP already present."
+    log_info "CLIP module already verified in Python."
 fi
 
 # Install evaluation support tools
