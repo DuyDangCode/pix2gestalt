@@ -95,14 +95,16 @@ log_info "--- Step 2/5: Installing Dependencies ---"
 
 pip install --upgrade pip setuptools wheel
 
-# Fix albumentations 0.4.3 wheel build issue on modern Python
+# Fix legacy pinned versions in requirements.txt on modern Python
 if [ -f "pix2gestalt/requirements.txt" ]; then
     sed -i 's/albumentations==0.4.3/albumentations>=1.0.0/g' pix2gestalt/requirements.txt 2>/dev/null || true
+    sed -i 's/imageio==2.9.0/imageio>=2.9.0/g' pix2gestalt/requirements.txt 2>/dev/null || true
+    sed -i 's/imageio-ffmpeg==0.4.2/imageio-ffmpeg>=0.4.2/g' pix2gestalt/requirements.txt 2>/dev/null || true
 fi
 
-# Pre-install binary wheel for albumentations and opencv to avoid legacy source compilation
-log_info "Pre-installing binary wheels for albumentations and opencv..."
-pip install --prefer-binary "albumentations>=1.0.0" opencv-python
+# Pre-install binary wheel for albumentations, opencv, and modern imageio to prevent conflicts
+log_info "Pre-installing binary wheels for albumentations, opencv, and imageio..."
+pip install --prefer-binary "albumentations>=1.0.0" opencv-python "imageio>=2.33.0"
 
 # Install base requirements
 if [ -f "pix2gestalt/requirements.txt" ]; then
@@ -110,7 +112,7 @@ if [ -f "pix2gestalt/requirements.txt" ]; then
     pip install --prefer-binary -r pix2gestalt/requirements.txt || {
         log_warn "Standard requirements install encountered issues, falling back to core dependencies..."
         pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
-        pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm "albumentations>=1.0.0"
+        pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm "albumentations>=1.0.0" "imageio>=2.33.0"
     }
 fi
 
@@ -134,7 +136,7 @@ fi
 
 # Install evaluation support tools
 log_info "Installing evaluation utilities (pycocotools, gdown, etc.)..."
-pip install pycocotools gdown scikit-image pandas > /dev/null 2>&1 || true
+pip install --prefer-binary pycocotools gdown pandas "imageio>=2.33.0" scikit-image > /dev/null 2>&1 || true
 
 log_success "All dependencies are installed and verified."
 
@@ -147,18 +149,35 @@ CKPT_DIR="${PROJECT_ROOT}/pix2gestalt/ckpt"
 mkdir -p "${CKPT_DIR}"
 CKPT_FILE="${CKPT_DIR}/epoch=000005.ckpt"
 
-if [ -f "${CKPT_FILE}" ] && [ "$(stat -c%s "${CKPT_FILE}" 2>/dev/null || stat -f%z "${CKPT_FILE}" 2>/dev/null || echo 0)" -gt 100000000 ]; then
-    log_info "Model checkpoint already exists: ${CKPT_FILE}"
+# The official epoch=000005.ckpt is ~15.4 GB (15,466,113,894 bytes)
+EXPECTED_CKPT_SIZE=15000000000
+CURRENT_SIZE=$(stat -c%s "${CKPT_FILE}" 2>/dev/null || stat -f%z "${CKPT_FILE}" 2>/dev/null || echo 0)
+
+if [ "${CURRENT_SIZE}" -ge "${EXPECTED_CKPT_SIZE}" ]; then
+    log_success "Model checkpoint verified (${CURRENT_SIZE} bytes, ~15.4 GB): ${CKPT_FILE}"
 else
-    log_info "Downloading pix2gestalt pretrained weights (epoch=000005.ckpt)..."
+    if [ "${CURRENT_SIZE}" -gt 0 ]; then
+        log_warn "Incomplete checkpoint file detected (${CURRENT_SIZE} bytes / ~15.4 GB). Resuming download with wget -c..."
+    else
+        log_info "Downloading pix2gestalt pretrained weights (epoch=000005.ckpt, 15.4 GB)..."
+    fi
     PRIMARY_URL="https://gestalt.cs.columbia.edu/assets/epoch=000005.ckpt"
     BACKUP_URL="https://huggingface.co/cvlab/pix2gestalt-weights/resolve/main/epoch=000005.ckpt"
 
+    # wget -c resumes interrupted downloads automatically
     if wget -c -P "${CKPT_DIR}" "${PRIMARY_URL}"; then
         log_success "Downloaded checkpoint from Columbia server."
     else
-        log_warn "Primary download failed, downloading from Hugging Face backup..."
+        log_warn "Primary download interrupted, downloading from Hugging Face backup..."
         wget -c -O "${CKPT_FILE}" "${BACKUP_URL}"
+    fi
+
+    # Check size again
+    FINAL_SIZE=$(stat -c%s "${CKPT_FILE}" 2>/dev/null || stat -f%z "${CKPT_FILE}" 2>/dev/null || echo 0)
+    if [ "${FINAL_SIZE}" -lt "${EXPECTED_CKPT_SIZE}" ]; then
+        log_error "Checkpoint file is still incomplete (${FINAL_SIZE} bytes). The file must be fully downloaded (~15.4 GB)."
+        log_error "Please run: wget -c -P ${CKPT_DIR} https://gestalt.cs.columbia.edu/assets/epoch=000005.ckpt"
+        exit 1
     fi
 fi
 
@@ -216,6 +235,34 @@ else
         cp "${DATA_DIR}/BSDS_amodal_test.json" "${BSDS_ANN_JSON}"
         log_success "Located BSDS_amodal_test.json in data/bsds."
     fi
+fi
+
+# Verify annotation file or dummy_test / auto_synth_ann flag before launching eval
+HAS_DUMMY_FLAG=false
+HAS_AUTO_SYNTH_FLAG=false
+for arg in "$@"; do
+    if [ "$arg" == "--dummy_test" ]; then
+        HAS_DUMMY_FLAG=true
+    elif [ "$arg" == "--auto_synth_ann" ]; then
+        HAS_AUTO_SYNTH_FLAG=true
+    fi
+done
+
+if [ ! -f "${BSDS_ANN_JSON}" ] && [ ! -d "${DATA_DIR}/visible_masks" ] && [ "${HAS_DUMMY_FLAG}" = false ] && [ "${HAS_AUTO_SYNTH_FLAG}" = false ]; then
+    echo -e "\n${YELLOW}${BOLD}======================================================================${RESET}"
+    echo -e "${YELLOW}${BOLD}  CHƯA TÌM THẤY FILE NHÃN: data/bsds/annotations/BSDS_amodal_test.json${RESET}"
+    echo -e "${YELLOW}${BOLD}======================================================================${RESET}"
+    echo -e "Script đã tải thành công toàn bộ ${GREEN}${NUM_EXISTING_IMAGES} ảnh gốc BSDS500${RESET} vào:"
+    echo -e "  ${BLUE}${IMAGES_DIR}/${RESET}"
+    echo -e "\nĐể đánh giá amodal mIoU trên tập BSDS-A, bạn cần file nhãn ${BOLD}BSDS_amodal_test.json${RESET}."
+    echo -e "Bạn có 3 lựa chọn:"
+    echo -e "  1. Copy file nhãn chính thức vào: ${GREEN}${BSDS_ANN_JSON}${RESET} rồi chạy lại script."
+    echo -e "  2. Tự động sinh nhãn mô phỏng trên chính 200 ảnh BSDS500 thật để chạy đánh giá ngay:"
+    echo -e "     ${BOLD}${GREEN}bash run_eval_bsds.sh --auto_synth_ann${RESET}"
+    echo -e "  3. Hoặc kiểm tra nhanh pipeline (smoke test) với dummy data:"
+    echo -e "     ${BOLD}${GREEN}bash run_eval_bsds.sh --dummy_test${RESET}"
+    echo -e "${YELLOW}${BOLD}======================================================================${RESET}\n"
+    exit 0
 fi
 
 # ==============================================================================

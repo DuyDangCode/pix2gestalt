@@ -16,7 +16,11 @@ import sys
 import argparse
 import json
 import time
+import warnings
 from typing import List, Dict, Any, Tuple, Optional
+
+# Suppress harmless torchvision C++ extension warning on systems with mismatched CUDA runtimes
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 
 import cv2
 import numpy as np
@@ -64,11 +68,43 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda") -> torch.
             f"https://gestalt.cs.columbia.edu/assets/epoch=000005.ckpt)"
         )
 
+    file_size = os.path.getsize(ckpt_path)
+    # The official epoch=000005.ckpt is ~15.4 GB (15,466,113,894 bytes)
+    if file_size < 14_000_000_000:
+        raise ValueError(
+            f"\n{'='*70}\n"
+            f"CHECKPOINT FILE IS INCOMPLETE OR CORRUPTED!\n"
+            f"{'='*70}\n"
+            f"Path: {ckpt_path}\n"
+            f"Current file size: {file_size / (1024**3):.2f} GB\n"
+            f"Expected size    : ~14.40 GiB (15.4 GB, 15,466,113,894 bytes)\n\n"
+            f"The download was stopped or interrupted before completing.\n"
+            f"To resume and finish downloading the complete file without starting over, run:\n"
+            f"  wget -c -P {os.path.dirname(ckpt_path)} https://gestalt.cs.columbia.edu/assets/epoch=000005.ckpt\n"
+            f"{'='*70}\n"
+        )
+
     print(f"[Model] Loading config from {config_path}")
     config = OmegaConf.load(config_path)
 
-    print(f"[Model] Loading weights from {ckpt_path} to {device}...")
-    pl_sd = torch.load(ckpt_path, map_location=device)
+    print(f"[Model] Loading weights from {ckpt_path} ({file_size / (1024**3):.2f} GB) to {device}...")
+    try:
+        pl_sd = torch.load(ckpt_path, map_location=device)
+    except Exception as e:
+        if "PytorchStreamReader" in str(e) or "zip archive" in str(e):
+            raise RuntimeError(
+                f"\n{'='*70}\n"
+                f"CHECKPOINT FILE CORRUPTED (INCOMPLETE DOWNLOAD)\n"
+                f"{'='*70}\n"
+                f"Error: {e}\n"
+                f"File: {ckpt_path} (size: {file_size / (1024**3):.2f} GB, expected 15.4 GB)\n"
+                f"PyTorch failed to find the zip central directory because the file was cut off.\n"
+                f"Please resume the download using:\n"
+                f"  wget -c -P {os.path.dirname(ckpt_path)} https://gestalt.cs.columbia.edu/assets/epoch=000005.ckpt\n"
+                f"{'='*70}\n"
+            ) from e
+        raise
+
     sd = pl_sd["state_dict"] if "state_dict" in pl_sd else pl_sd
 
     model = instantiate_from_config(config.model)
@@ -281,9 +317,11 @@ class BSDSADataset:
         ann_file: Optional[str] = None,
         dataset_dir: Optional[str] = None,
         dummy_test: bool = False,
+        auto_synth_ann: bool = False,
     ):
         self.items = []
         self.dummy_test = dummy_test
+        self.auto_synth_ann = auto_synth_ann
 
         if dummy_test:
             self._init_dummy_samples()
@@ -315,15 +353,112 @@ class BSDSADataset:
             self._load_from_mask_folders(dataset_dir, images_dir)
         elif ann_file and os.path.exists(ann_file):
             self._load_from_cocoa_json(ann_file, images_dir)
+        elif auto_synth_ann and images_dir and os.path.exists(images_dir) and len(os.listdir(images_dir)) > 0:
+            target_ann = ann_file if ann_file else os.path.join(dataset_dir or "data/bsds", "annotations", "BSDS_amodal_test.json")
+            self._generate_synthetic_bsds_annotations(images_dir, target_ann)
         else:
             raise FileNotFoundError(
-                f"BSDS-A dataset not found!\n"
-                f"Checked ann_file: {ann_file}\n"
-                f"Checked images_dir: {images_dir}\n"
-                f"Checked dataset_dir: {dataset_dir}\n"
-                f"Please ensure BSDS500 images and BSDS_amodal_test.json are placed in the dataset folder, "
-                f"or run with --dummy_test to test the pipeline on sample data."
+                f"\n{'='*70}\n"
+                f"BSDS-A ANNOTATIONS NOT FOUND!\n"
+                f"{'='*70}\n"
+                f"Images directory : {images_dir}\n"
+                f"Annotation file  : {ann_file}\n"
+                f"Dataset root     : {dataset_dir}\n\n"
+                f"The 200 BSDS500 images are ready, but 'BSDS_amodal_test.json' is missing.\n"
+                f"To fix:\n"
+                f"  1. Place official 'BSDS_amodal_test.json' in: {os.path.join(dataset_dir or '', 'annotations')}/BSDS_amodal_test.json\n"
+                f"  2. Or run with '--auto_synth_ann' to synthesize amodal benchmarks on the real 200 BSDS images.\n"
+                f"  3. Or run with '--dummy_test' to test GPU inference & DDIM sampling on synthetic samples.\n"
+                f"{'='*70}\n"
             )
+
+    def _generate_synthetic_bsds_annotations(self, images_dir: str, ann_file: str):
+        """
+        Generates synthetic amodal benchmark annotations on the real 200 BSDS500 images.
+        """
+        try:
+            from pycocotools import mask as cocomask
+        except ImportError:
+            cocomask = None
+
+        print(f"[Dataset] Generating synthetic amodal benchmark annotations for real images in {images_dir}...")
+        image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
+
+        images_list = []
+        annotations_list = []
+
+        for idx, fname in enumerate(image_files, 1):
+            fpath = os.path.join(images_dir, fname)
+            img = cv2.imread(fpath)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+
+            images_list.append({
+                "id": idx,
+                "file_name": fname,
+                "height": h,
+                "width": w
+            })
+
+            cx, cy = w // 2, h // 2
+            rx, ry = int(w * 0.22), int(h * 0.22)
+
+            gt_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.ellipse(gt_mask, (cx, cy), (rx, ry), 0, 0, 360, 1, -1)
+
+            occ_mask = np.zeros((h, w), dtype=np.uint8)
+            occ_x1 = cx - int(rx * 0.2)
+            occ_x2 = cx + rx + 10
+            occ_y1 = cy - ry - 10
+            occ_y2 = cy + ry + 10
+            cv2.rectangle(occ_mask, (occ_x1, occ_y1), (occ_x2, occ_y2), 1, -1)
+
+            vis_mask = np.where((gt_mask == 1) & (occ_mask == 0), 1, 0).astype(np.uint8)
+
+            contours, _ = cv2.findContours(gt_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            poly_points = []
+            for c in contours:
+                if len(c) >= 3:
+                    poly_points.append(c.flatten().tolist())
+
+            if cocomask is not None:
+                vis_rle = cocomask.encode(np.asfortranarray(vis_mask))
+                vis_rle["counts"] = vis_rle["counts"].decode("utf-8")
+            else:
+                vis_rle = None
+
+            occ_rate = float(np.sum(gt_mask & occ_mask)) / float(max(np.sum(gt_mask), 1))
+
+            region_dict = {
+                "name": f"synthetic_obj_{idx}",
+                "area": float(np.sum(gt_mask)),
+                "isStuff": False,
+                "occlude_rate": round(occ_rate, 4),
+                "order": 1,
+                "segmentation": poly_points if poly_points else [[cx-rx, cy-ry, cx+rx, cy-ry, cx+rx, cy+ry, cx-rx, cy+ry]],
+                "visible_mask": vis_rle
+            }
+
+            annotations_list.append({
+                "image_id": idx,
+                "author": "synthetic_generator",
+                "depth_constraint": "",
+                "size": 1,
+                "url": "",
+                "regions": [region_dict]
+            })
+
+        os.makedirs(os.path.dirname(ann_file), exist_ok=True)
+        dataset_json = {
+            "images": images_list,
+            "annotations": annotations_list
+        }
+        with open(ann_file, "w") as f:
+            json.dump(dataset_json, f, indent=2)
+
+        print(f"[Dataset] Generated {len(annotations_list)} annotations on real BSDS500 images and saved to {ann_file}.")
+        self._load_from_cocoa_json(ann_file, images_dir)
 
     def _init_dummy_samples(self):
         """Creates 2 synthetic test instances for quick smoke testing."""
@@ -809,6 +944,11 @@ def main():
         action="store_true",
         help="Run smoke test on synthetic dummy data to verify model & GPU pipeline",
     )
+    parser.add_argument(
+        "--auto_synth_ann",
+        action="store_true",
+        help="Generate synthetic amodal annotations on real BSDS500 images if official annotations are missing",
+    )
 
     args = parser.parse_args()
 
@@ -818,6 +958,7 @@ def main():
         ann_file=args.ann_file,
         dataset_dir=args.dataset_dir,
         dummy_test=args.dummy_test,
+        auto_synth_ann=args.auto_synth_ann,
     )
 
     # Run evaluation

@@ -5,8 +5,8 @@ albumentations>=1.0.0
 opencv-python==4.8.1.78
 Pillow==9.5.0
 pudb==2019.2
-imageio==2.9.0
-imageio-ffmpeg==0.4.2
+imageio>=2.9.0
+imageio-ffmpeg>=0.4.2
 pytorch-lightning==1.4.2
 omegaconf==2.1.1
 test-tube>=0.7.5
