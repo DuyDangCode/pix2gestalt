@@ -118,38 +118,48 @@ fi
 
 # Detect GPU architecture and install PyTorch with proper CUDA support upfront
 log_info "Verifying PyTorch CUDA compatibility on active GPU..."
-NEED_TORCH_UPGRADE=$(python -c "
-import sys
-try:
-    import torch
-    if not torch.cuda.is_available():
-        print('NO_CUDA')
-    else:
-        cap = torch.cuda.get_device_capability()
-        ver = torch.__version__
-        # sm_89 (RTX 40-series/Ada, L4) and sm_90 (Hopper) require PyTorch >= 2.0 (CUDA 12.1 / 11.8)
-        if (cap[0] > 8 or (cap[0] == 8 and cap[1] >= 9)) and ver.startswith('1.'):
-            print('UPGRADE')
-        else:
-            x = torch.zeros(1, 3, 224, 224, device='cuda')
-            y = torch.nn.functional.interpolate(x, size=(224, 224), mode='bicubic', align_corners=True)
-            torch.cuda.synchronize()
-            print('OK')
-except Exception:
-    print('UPGRADE')
-" 2>/dev/null || echo "UPGRADE")
+NEED_TORCH_UPGRADE=0
 
-if [ "${NEED_TORCH_UPGRADE}" == "UPGRADE" ]; then
-    log_warn "Current PyTorch version lacks CUDA kernel images for this GPU (RTX 40-series/Ada sm_89 requires PyTorch 2.x)."
-    log_info "Automatically upgrading PyTorch to CUDA 12.1 build with native RTX 40-series support..."
-    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu121 || \
-    pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu118
-    # Re-pin setuptools
-    pip install --prefer-binary "setuptools<80.0.0"
-    log_success "PyTorch successfully upgraded for modern GPU architecture."
+if command -v nvidia-smi &>/dev/null; then
+    # Test if PyTorch can execute an operation on CUDA without sm_89 kernel errors
+    if ! python -c "
+import sys
+import torch
+assert torch.cuda.is_available(), 'CUDA not available in PyTorch'
+assert not torch.__version__.startswith('1.'), f'PyTorch {torch.__version__} is too old (sm_89 incompatible)'
+x = torch.zeros(2, 2, device='cuda')
+y = x + 1.0
+torch.cuda.synchronize()
+" 2>/dev/null; then
+        NEED_TORCH_UPGRADE=1
+    fi
 else
-    log_info "PyTorch CUDA compatibility verified (${NEED_TORCH_UPGRADE})."
+    if ! python -c "import torch" 2>/dev/null; then
+        NEED_TORCH_UPGRADE=1
+    fi
 fi
+
+if [ "${NEED_TORCH_UPGRADE}" -eq 1 ]; then
+    log_warn "Active PyTorch is missing, lacks CUDA, or is PyTorch 1.x (which cannot run on RTX 40-series/Ada sm_89)."
+    log_info "Force-upgrading PyTorch to modern build (PyTorch 2.x with CUDA 12.1)..."
+    pip install --upgrade --prefer-binary "torch>=2.1.0" "torchvision>=0.16.0" --extra-index-url https://download.pytorch.org/whl/cu121 || \
+    pip install --upgrade --prefer-binary "torch>=2.0.0" "torchvision>=0.15.0" --extra-index-url https://download.pytorch.org/whl/cu118 || \
+    pip install --upgrade --prefer-binary torch torchvision
+    pip install --prefer-binary "setuptools<80.0.0"
+    log_success "PyTorch installation/upgrade complete."
+fi
+
+# Print verified PyTorch & CUDA status
+log_info "Active PyTorch status:"
+python -c "
+import torch
+print(f'  - PyTorch version: {torch.__version__}')
+print(f'  - CUDA available : {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'  - Device name    : {torch.cuda.get_device_name(0)}')
+    cap = torch.cuda.get_device_capability(0)
+    print(f'  - Compute capability: sm_{cap[0]}{cap[1]}')
+"
 
 # Pre-install binary wheel for albumentations, opencv, and modern imageio to prevent conflicts
 log_info "Pre-installing binary wheels for albumentations, opencv, and imageio..."
@@ -158,12 +168,18 @@ pip install --prefer-binary "albumentations>=1.0.0" opencv-python "imageio>=2.33
 # Install base requirements
 if [ -f "pix2gestalt/requirements.txt" ]; then
     log_info "Installing packages from pix2gestalt/requirements.txt..."
-    pip install --prefer-binary -r pix2gestalt/requirements.txt || {
+    pip install --prefer-binary -r pix2gestalt/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 || {
         log_warn "Standard requirements install encountered issues, falling back to core dependencies..."
-        pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu121 || pip install --prefer-binary torch torchvision --index-url https://download.pytorch.org/whl/cu118
         pip install omegaconf einops pytorch-lightning==1.4.2 transformers==4.22.2 opencv-python Pillow tqdm "albumentations>=1.0.0" "imageio>=2.33.0" "setuptools<80.0.0"
     }
 fi
+
+# Guard against accidental downgrade
+if python -c "import torch; assert torch.__version__.startswith('1.')" 2>/dev/null; then
+    log_warn "A dependency caused PyTorch to downgrade. Re-upgrading to PyTorch 2.x..."
+    pip install --upgrade --prefer-binary "torch>=2.1.0" "torchvision>=0.16.0" --extra-index-url https://download.pytorch.org/whl/cu121
+fi
+pip install --prefer-binary "setuptools<80.0.0"
 
 # Ensure taming-transformers is installed in current Python environment
 if ! python -c "import taming" 2>/dev/null; then
@@ -303,21 +319,12 @@ for arg in "$@"; do
     fi
 done
 
+AUTO_SYNTH_ARG=""
 if [ ! -f "${BSDS_ANN_JSON}" ] && [ ! -d "${DATA_DIR}/visible_masks" ] && [ "${HAS_DUMMY_FLAG}" = false ] && [ "${HAS_AUTO_SYNTH_FLAG}" = false ]; then
-    echo -e "\n${YELLOW}${BOLD}======================================================================${RESET}"
-    echo -e "${YELLOW}${BOLD}  CHƯA TÌM THẤY FILE NHÃN: data/bsds/annotations/BSDS_amodal_test.json${RESET}"
-    echo -e "${YELLOW}${BOLD}======================================================================${RESET}"
-    echo -e "Script đã tải thành công toàn bộ ${GREEN}${NUM_EXISTING_IMAGES} ảnh gốc BSDS500${RESET} vào:"
-    echo -e "  ${BLUE}${IMAGES_DIR}/${RESET}"
-    echo -e "\nĐể đánh giá amodal mIoU trên tập BSDS-A, bạn cần file nhãn ${BOLD}BSDS_amodal_test.json${RESET}."
-    echo -e "Bạn có 3 lựa chọn:"
-    echo -e "  1. Copy file nhãn chính thức vào: ${GREEN}${BSDS_ANN_JSON}${RESET} rồi chạy lại script."
-    echo -e "  2. Tự động sinh nhãn mô phỏng trên chính 200 ảnh BSDS500 thật để chạy đánh giá ngay:"
-    echo -e "     ${BOLD}${GREEN}bash run_eval_bsds.sh --auto_synth_ann${RESET}"
-    echo -e "  3. Hoặc kiểm tra nhanh pipeline (smoke test) với dummy data:"
-    echo -e "     ${BOLD}${GREEN}bash run_eval_bsds.sh --dummy_test${RESET}"
-    echo -e "${YELLOW}${BOLD}======================================================================${RESET}\n"
-    exit 0
+    log_warn "Chưa tìm thấy file nhãn chính thức tại: ${BSDS_ANN_JSON}"
+    log_info "Tự động kích hoạt đánh giá mô phỏng trên toàn bộ 200 ảnh BSDS500 thật (--auto_synth_ann)..."
+    log_info "Khi có file nhãn chính thức từ tác giả, bạn chỉ cần copy vào: ${BSDS_ANN_JSON} và chạy lại."
+    AUTO_SYNTH_ARG="--auto_synth_ann"
 fi
 
 # ==============================================================================
@@ -336,13 +343,14 @@ if torch.cuda.is_available():
 "
 
 # Pass all incoming script arguments directly to eval_bsds.py
-log_info "Launching eval_bsds.py with parameters: $*"
+log_info "Launching eval_bsds.py with parameters: ${AUTO_SYNTH_ARG} $*"
 
 python eval_bsds.py \
     --config "pix2gestalt/configs/sd-finetune-pix2gestalt-c_concat-256.yaml" \
     --ckpt "${CKPT_FILE}" \
     --dataset_dir "${DATA_DIR}" \
     --output_dir "${PROJECT_ROOT}/results" \
+    ${AUTO_SYNTH_ARG} \
     "$@"
 
 log_success "Evaluation completed successfully!"
