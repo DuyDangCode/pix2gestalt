@@ -203,9 +203,12 @@ def sample_pix2gestalt(
     Returns:
         List of np.ndarray: Each sample is an RGB uint8 image of shape (h, w, 3).
     """
-    precision_scope = autocast if (precision == "autocast" and "cuda" in device) else nullcontext
+    if precision == "autocast" and torch.cuda.is_available() and "cuda" in device:
+        precision_scope = torch.cuda.amp.autocast(enabled=True)
+    else:
+        precision_scope = nullcontext()
 
-    with precision_scope("cuda"):
+    with precision_scope:
         with model.ema_scope():
             cond = {}
             # Channel 1: CLIP embedding of input image

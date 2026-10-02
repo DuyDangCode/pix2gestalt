@@ -36,8 +36,11 @@ def load_model_from_config(config, ckpt, device, verbose=False):
 @torch.no_grad()
 def sample_model(input_im, visible_mask, model, sampler, precision, h, w, ddim_steps, n_samples, scale, \
                  ddim_eta):
-    precision_scope = autocast if precision=="autocast" else nullcontext
-    with precision_scope("cuda"):
+    if precision == "autocast" and torch.cuda.is_available():
+        precision_scope = torch.cuda.amp.autocast(enabled=True)
+    else:
+        precision_scope = nullcontext()
+    with precision_scope:
         with model.ema_scope():
             
             cond = {}   
