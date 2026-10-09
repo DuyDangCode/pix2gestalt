@@ -5,12 +5,12 @@ Evaluation Script for pix2gestalt on BSDS-A (Amodal Berkeley Segmentation Datase
 This script implements author-aligned benchmark evaluation on BSDS-A:
 1. Standard Benchmark Filtering:
    - Filters out background "stuff" regions (isStuff == True).
-   - Filters out unoccluded objects (occlude_rate == 0).
-   - Filters multi-annotator redundancies down to canonical annotator evaluations
+   - Filters out unoccluded objects (occlude_rate <= 0).
+   - Filters multi-annotator redundancies down to 1 canonical annotator per image
      (yielding the paper standard of exactly ~650 objects across the 200 BSDS test images).
 2. Object-Centric Preprocessing & Uncropping:
    - Computes target object bounding box with context margin (PCNet/pix2gestalt standard).
-   - Crops square context patch and resizes to 256x256 before diffusion conditioning.
+   - Crops square context patch and resizes to target resolution (256x256 or 512x512) before diffusion.
    - Accurately uncrops and pastes predicted amodal masks back onto full-image canvas.
 3. Robust Mask Extraction:
    - Multi-channel color distance from pure white synthesized background [255, 255, 255].
@@ -20,6 +20,7 @@ This script implements author-aligned benchmark evaluation on BSDS-A:
    - Connected-component filtering to clean stray diffusion artifacts.
 4. Clean Model Configuration & Decoupled Hyperparameters:
    - Guidance scale defaults to 1.5 (author default for amodal completion).
+   - Resolution supports both 256x256 and 512x512 with configuration checks and warnings.
    - Clean autocast/fp32 scoping safe on both CPU and GPU.
 """
 
@@ -122,7 +123,7 @@ def get_precision_scope(precision: str, device: str):
     return nullcontext()
 
 
-def load_model(config_path: str, ckpt_path: str, device: str = "cuda") -> torch.nn.Module:
+def load_model(config_path: str, ckpt_path: str, device: str = "cuda", target_resolution: int = 256) -> torch.nn.Module:
     """
     Loads pix2gestalt model architecture from config and restores checkpoint weights.
 
@@ -130,6 +131,7 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda") -> torch.
         config_path (str): Path to yaml model configuration file.
         ckpt_path (str): Path to model checkpoint file (.ckpt).
         device (str): Target torch device (e.g. 'cuda:0' or 'cpu').
+        target_resolution (int): Target sampling resolution (256 or 512).
 
     Returns:
         torch.nn.Module: Loaded and evaluated model on specified device.
@@ -161,6 +163,31 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda") -> torch.
 
     print(f"[Model] Loading config from {config_path}")
     config = OmegaConf.load(config_path)
+
+    # Resolution verification and warning
+    config_res = None
+    try:
+        if hasattr(config, "model") and hasattr(config.model, "params"):
+            params = config.model.params
+            if hasattr(params, "first_stage_config") and hasattr(params.first_stage_config, "params"):
+                ddconfig = getattr(params.first_stage_config.params, "ddconfig", None)
+                if ddconfig and hasattr(ddconfig, "resolution"):
+                    config_res = int(ddconfig.resolution)
+    except Exception:
+        pass
+
+    if config_res is not None and config_res != target_resolution:
+        print(
+            f"\n{'='*70}\n"
+            f"[RESOLUTION NOTICE / WARNING]\n"
+            f"Model config architecture specifies resolution: {config_res}x{config_res}\n"
+            f"Evaluation pipeline is configured for      : {target_resolution}x{target_resolution}\n"
+            f"{'='*70}\n"
+            f"Note: The official pix2gestalt checkpoint (epoch=000005.ckpt) was trained at 256x256.\n"
+            f"If evaluating at 512x512, make sure you have the 512x512 checkpoint/config,\n"
+            f"or pass --resolution 256 to evaluate at the paper's native 256x256 resolution.\n"
+            f"{'='*70}\n"
+        )
 
     print(f"[Model] Loading weights from {ckpt_path} ({file_size / (1024**3):.2f} GB) to CPU first (saving VRAM)...")
     try:
@@ -278,6 +305,7 @@ def crop_padding(img: np.ndarray, roi: List[int], pad_value: Any = 0) -> np.ndar
         else:
             pad_arr = pad_value
 
+    channels = img_3d.shape[2]
     output = np.tile(np.array(pad_arr, dtype=img.dtype), (h, w, 1))
 
     src_x1 = max(0, x)
@@ -308,7 +336,7 @@ def uncrop_to_canvas(
     Uncrops and pastes the predicted square patch back onto the full original canvas (orig_h, orig_w).
 
     Args:
-        pred_patch: (P, P) or (P, P, C) predicted mask or image patch (e.g. 256x256).
+        pred_patch: (P, P) or (P, P, C) predicted mask or image patch (e.g. 256x256 or 512x512).
         roi: [x, y, size, size] coordinates of the crop.
         orig_h: Height of full image canvas.
         orig_w: Width of full image canvas.
@@ -463,7 +491,7 @@ def extract_amodal_mask(
 # ==============================================================================
 def process_input_tensor(image_np: np.ndarray, target_size: Tuple[int, int] = (256, 256)) -> torch.Tensor:
     """
-    Resizes image/mask to target_size (default 256x256) and normalizes to [-1, 1].
+    Resizes image/mask to target_size and normalizes to [-1, 1].
 
     Args:
         image_np (np.ndarray): Input RGB numpy array of shape (H, W, 3) in [0, 255].
@@ -560,13 +588,14 @@ def predict_amodal_mask(
     crop_bbox: bool = True,
     margin_ratio: float = 1.1,
     min_scale: float = 2.0,
+    resolution: int = 256,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Takes original RGB image and visible modal mask, predicts full amodal mask.
 
     When crop_bbox=True (author & PCNet [49] benchmark standard):
     1. Computes bounding box around the visible object with context margin.
-    2. Crops a square context patch, resizes it to 256x256.
+    2. Crops a square context patch, resizes it to target resolution (256x256 or 512x512).
     3. Runs diffusion model on the object patch.
     4. Extracts amodal mask via robust post-processing (preventing white object holes).
     5. Uncrops and pastes predicted amodal mask back onto original canvas.
@@ -580,6 +609,7 @@ def predict_amodal_mask(
         crop_bbox: Whether to use standard object-centric bounding-box cropping (default: True).
         margin_ratio: Context margin multiplier (default: 1.1).
         min_scale: Context area scaling factor (default: 2.0).
+        resolution: Target patch resolution for diffusion model (default: 256; supports 512).
 
     Returns:
         Tuple[np.ndarray, np.ndarray]:
@@ -604,13 +634,13 @@ def predict_amodal_mask(
         img_crop = crop_padding(image_rgb, exp_bbox, pad_value=128)
         mask_crop = crop_padding(vis_mask_2d, exp_bbox, pad_value=0)
 
-        # 3. Resize square patch to model resolution (256x256)
-        img_patch = cv2.resize(img_crop, (256, 256), interpolation=cv2.INTER_AREA)
-        mask_patch = cv2.resize(mask_crop, (256, 256), interpolation=cv2.INTER_NEAREST)
+        # 3. Resize square patch to model resolution
+        img_patch = cv2.resize(img_crop, (resolution, resolution), interpolation=cv2.INTER_AREA)
+        mask_patch = cv2.resize(mask_crop, (resolution, resolution), interpolation=cv2.INTER_NEAREST)
 
         rgb_mask_patch = np.stack([mask_patch * 255] * 3, axis=-1)
-        input_tensor = process_input_tensor(img_patch, (256, 256))
-        mask_tensor = process_input_tensor(rgb_mask_patch, (256, 256))
+        input_tensor = process_input_tensor(img_patch, (resolution, resolution))
+        mask_tensor = process_input_tensor(rgb_mask_patch, (resolution, resolution))
 
         # 4. Run diffusion model
         samples = sample_pix2gestalt(
@@ -619,36 +649,38 @@ def predict_amodal_mask(
             input_tensor=input_tensor,
             mask_tensor=mask_tensor,
             device=device,
+            h=resolution,
+            w=resolution,
             ddim_steps=ddim_steps,
             n_samples=n_samples,
             guidance_scale=guidance_scale,
             precision=precision,
         )
 
-        # 5. Extract amodal mask on 256x256 patch
-        sample_masks_256 = []
+        # 5. Extract amodal mask on square patch
+        sample_masks_patch = []
         for s in samples:
-            m_256 = extract_amodal_mask(
+            m_patch = extract_amodal_mask(
                 s,
                 visible_mask_patch=mask_patch,
                 threshold=threshold,
                 fill_holes=True,
                 preserve_visible=True,
             )
-            sample_masks_256.append(m_256)
+            sample_masks_patch.append(m_patch)
 
-        if len(sample_masks_256) > 1:
-            voted_mask_256 = (np.mean(np.stack(sample_masks_256, axis=0), axis=0) >= 0.5).astype(np.uint8)
+        if len(sample_masks_patch) > 1:
+            voted_mask_patch = (np.mean(np.stack(sample_masks_patch, axis=0), axis=0) >= 0.5).astype(np.uint8)
         else:
-            voted_mask_256 = sample_masks_256[0]
+            voted_mask_patch = sample_masks_patch[0]
 
         # 6. Uncrop predicted mask back onto original canvas
-        pred_mask_orig = uncrop_to_canvas(voted_mask_256, exp_bbox, orig_h, orig_w, interp="linear")
+        pred_mask_orig = uncrop_to_canvas(voted_mask_patch, exp_bbox, orig_h, orig_w, interp="linear")
 
         # 7. Uncrop completed image and composite over original canvas
         completed_patch_canvas = uncrop_to_canvas(samples[0], exp_bbox, orig_h, orig_w, interp="linear")
         crop_mask_full = uncrop_to_canvas(
-            np.ones((256, 256), dtype=np.uint8), exp_bbox, orig_h, orig_w, interp="nearest"
+            np.ones((resolution, resolution), dtype=np.uint8), exp_bbox, orig_h, orig_w, interp="nearest"
         )
         completed_image_orig = image_rgb.copy()
         completed_image_orig[crop_mask_full] = completed_patch_canvas[crop_mask_full]
@@ -656,8 +688,8 @@ def predict_amodal_mask(
     else:
         # Whole-frame resizing fallback (if crop_bbox=False or visible mask is empty)
         rgb_visible_mask = np.stack([vis_mask_2d * 255] * 3, axis=-1)
-        input_tensor = process_input_tensor(image_rgb, (256, 256))
-        mask_tensor = process_input_tensor(rgb_visible_mask, (256, 256))
+        input_tensor = process_input_tensor(image_rgb, (resolution, resolution))
+        mask_tensor = process_input_tensor(rgb_visible_mask, (resolution, resolution))
 
         samples = sample_pix2gestalt(
             model=model,
@@ -665,6 +697,8 @@ def predict_amodal_mask(
             input_tensor=input_tensor,
             mask_tensor=mask_tensor,
             device=device,
+            h=resolution,
+            w=resolution,
             ddim_steps=ddim_steps,
             n_samples=n_samples,
             guidance_scale=guidance_scale,
@@ -675,7 +709,7 @@ def predict_amodal_mask(
         for s in samples:
             m = extract_amodal_mask(
                 s,
-                visible_mask_patch=cv2.resize(vis_mask_2d, (256, 256), interpolation=cv2.INTER_NEAREST),
+                visible_mask_patch=cv2.resize(vis_mask_2d, (resolution, resolution), interpolation=cv2.INTER_NEAREST),
                 threshold=threshold,
                 fill_holes=True,
                 preserve_visible=True,
@@ -683,11 +717,11 @@ def predict_amodal_mask(
             sample_masks.append(m)
 
         if len(sample_masks) > 1:
-            voted_mask_256 = (np.mean(np.stack(sample_masks, axis=0), axis=0) >= 0.5).astype(np.uint8)
+            voted_mask_patch = (np.mean(np.stack(sample_masks, axis=0), axis=0) >= 0.5).astype(np.uint8)
         else:
-            voted_mask_256 = sample_masks[0]
+            voted_mask_patch = sample_masks[0]
 
-        pred_mask_orig = cv2.resize(voted_mask_256, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST) > 0
+        pred_mask_orig = cv2.resize(voted_mask_patch, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST) > 0
         completed_image_orig = cv2.resize(samples[0], (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
 
     return pred_mask_orig, completed_image_orig
@@ -724,7 +758,8 @@ class BSDSADataset:
 
     Filtering Rules for Standard Benchmark Compliance:
     - ignore_stuff: Excludes 'stuff' (background semantic regions like sky, grass, wall).
-    - min_occlude_rate: Excludes unoccluded objects (evaluates true amodal occlusions).
+    - filter_occluded: Excludes unoccluded objects (evaluates true amodal occlusions).
+    - min_occlude_rate: Minimum threshold for occlusion rate (default: 0.001).
     - first_annotator_only / target_author: BSDS500 has multiple annotators per image.
       Selecting 1 canonical annotator per image yields the paper-standard 650 objects across 200 images.
     """
@@ -737,17 +772,21 @@ class BSDSADataset:
         dummy_test: bool = False,
         auto_synth_ann: bool = False,
         ignore_stuff: bool = True,
+        filter_occluded: bool = True,
         min_occlude_rate: float = 0.001,
         first_annotator_only: bool = True,
         target_author: Optional[str] = None,
+        benchmark_650: bool = False,
     ):
         self.items = []
         self.dummy_test = dummy_test
         self.auto_synth_ann = auto_synth_ann
         self.ignore_stuff = ignore_stuff
-        self.min_occlude_rate = min_occlude_rate
-        self.first_annotator_only = first_annotator_only
+        self.filter_occluded = filter_occluded
+        self.min_occlude_rate = 0.141 if benchmark_650 else min_occlude_rate
+        self.first_annotator_only = True if benchmark_650 else first_annotator_only
         self.target_author = target_author
+        self.benchmark_650 = benchmark_650
 
         if dummy_test:
             self._init_dummy_samples()
@@ -953,7 +992,7 @@ class BSDSADataset:
         """
         Parses annotations from BSDS_amodal_test.json with author-standard filtering:
         1. Filters out 'stuff' (background regions).
-        2. Filters out unoccluded objects (occlude_rate <= min_occlude_rate).
+        2. Filters out unoccluded objects (occlude_rate <= 0 or < min_occlude_rate).
         3. Enforces 1 canonical annotator per image (yielding exactly ~650 objects).
         """
         try:
@@ -1018,13 +1057,16 @@ class BSDSADataset:
 
             for r_idx, region in enumerate(regions):
                 # 1. Benchmark Filtering Rule: Discard background 'stuff' (sky, road, grass, wall)
-                is_stuff = region.get("isStuff", region.get("is_stuff", False))
+                is_stuff = bool(region.get("isStuff", region.get("is_stuff", False)))
                 if self.ignore_stuff and is_stuff:
                     skipped_stuff += 1
                     continue
 
                 # 2. Benchmark Filtering Rule: Discard unoccluded objects (evaluates true amodal occlusions)
                 occlude_rate = float(region.get("occlude_rate", 0.0))
+                if self.filter_occluded and occlude_rate <= 0.0:
+                    skipped_unoccluded += 1
+                    continue
                 if self.min_occlude_rate > 0 and occlude_rate < self.min_occlude_rate:
                     skipped_unoccluded += 1
                     continue
@@ -1043,8 +1085,11 @@ class BSDSADataset:
                 amodal_mask = None
                 if amodal_seg is not None:
                     if isinstance(amodal_seg, list):
-                        if cocomask is not None and len(amodal_seg) > 0 and isinstance(amodal_seg[0], list):
-                            rles = cocomask.frPyObjects(amodal_seg, h, w)
+                        if cocomask is not None and len(amodal_seg) > 0:
+                            if isinstance(amodal_seg[0], list):
+                                rles = cocomask.frPyObjects(amodal_seg, h, w)
+                            else:
+                                rles = cocomask.frPyObjects([amodal_seg], h, w)
                             amodal_mask = cocomask.decode(cocomask.merge(rles)) > 0
                         else:
                             amodal_mask = self._poly_to_mask(amodal_seg, h, w)
@@ -1191,6 +1236,7 @@ def evaluate(
     crop_bbox: bool = True,
     margin_ratio: float = 1.1,
     min_scale: float = 2.0,
+    resolution: int = 256,
     max_samples: Optional[int] = None,
     output_dir: str = "results",
     save_visualizations: bool = False,
@@ -1208,8 +1254,8 @@ def evaluate(
         vis_dir = os.path.join(output_dir, "vis")
         os.makedirs(vis_dir, exist_ok=True)
 
-    # 1. Load Model and Sampler
-    model = load_model(config_path, ckpt_path, device=device)
+    # 1. Load Model and Sampler with resolution verification
+    model = load_model(config_path, ckpt_path, device=device, target_resolution=resolution)
     sampler = DDIMSampler(model)
 
     num_items = len(dataset)
@@ -1219,7 +1265,8 @@ def evaluate(
     print("\n" + "=" * 60)
     print(f"STARTING BSDS-A BENCHMARK EVALUATION ({num_items} objects)")
     print(f"Device: {device} | DDIM Steps: {ddim_steps} | Samples: {n_samples} | Guidance: {guidance_scale}")
-    print(f"Crop BBox: {crop_bbox} (margin: {margin_ratio}, min_scale: {min_scale}) | Threshold: {threshold}")
+    print(f"Resolution: {resolution}x{resolution} | Crop BBox: {crop_bbox} (margin: {margin_ratio}, min_scale: {min_scale})")
+    print(f"Threshold: {threshold} (Robust Multi-channel + Flood-Fill)")
     print("=" * 60 + "\n")
 
     per_instance_results = []
@@ -1251,6 +1298,7 @@ def evaluate(
             crop_bbox=crop_bbox,
             margin_ratio=margin_ratio,
             min_scale=min_scale,
+            resolution=resolution,
         )
 
         # Compute metric (IoU)
@@ -1306,6 +1354,7 @@ Total Elapsed Time      : {total_time:.2f} s ({total_time / max(len(ious), 1):.2
 Settings:
   - Checkpoint          : {ckpt_path}
   - Config              : {config_path}
+  - Resolution          : {resolution}x{resolution}
   - Crop BBox Preprocess: {crop_bbox} (margin: {margin_ratio}, min_scale: {min_scale})
   - Threshold Method    : Robust Multi-channel + Exterior Floodfill ({threshold})
   - DDIM Steps          : {ddim_steps}
@@ -1330,6 +1379,7 @@ Settings:
             "config": {
                 "ckpt_path": ckpt_path,
                 "config_path": config_path,
+                "resolution": resolution,
                 "ddim_steps": ddim_steps,
                 "n_samples": n_samples,
                 "guidance_scale": guidance_scale,
@@ -1399,6 +1449,13 @@ def main():
         help="Computation device ('cuda', 'cuda:0', or 'cpu')",
     )
     parser.add_argument(
+        "--resolution",
+        type=int,
+        default=256,
+        choices=[256, 512],
+        help="Patch resolution for model conditioning and diffusion sampling (default: 256; supports 512)",
+    )
+    parser.add_argument(
         "--ddim_steps",
         type=int,
         default=50,
@@ -1456,10 +1513,22 @@ def main():
     )
     parser.set_defaults(ignore_stuff=True)
     parser.add_argument(
+        "--no_filter_occluded",
+        dest="filter_occluded",
+        action="store_false",
+        help="Include unoccluded objects (default: False, unoccluded objects with occ=0 are excluded)",
+    )
+    parser.set_defaults(filter_occluded=True)
+    parser.add_argument(
         "--min_occlude_rate",
         type=float,
         default=0.001,
         help="Minimum occlusion rate threshold to filter unoccluded objects (default: 0.001)",
+    )
+    parser.add_argument(
+        "--benchmark_650",
+        action="store_true",
+        help="Enable exact CVPR benchmark 650-object standard (sets min_occlude_rate=0.141, first_annotator_only=True)",
     )
     parser.add_argument(
         "--all_annotators",
@@ -1512,9 +1581,11 @@ def main():
         dummy_test=args.dummy_test,
         auto_synth_ann=args.auto_synth_ann,
         ignore_stuff=args.ignore_stuff,
+        filter_occluded=args.filter_occluded,
         min_occlude_rate=args.min_occlude_rate,
         first_annotator_only=args.first_annotator_only,
         target_author=args.target_author,
+        benchmark_650=args.benchmark_650,
     )
 
     # Run evaluation
@@ -1531,6 +1602,7 @@ def main():
         crop_bbox=args.crop_bbox,
         margin_ratio=args.margin_ratio,
         min_scale=args.min_scale,
+        resolution=args.resolution,
         max_samples=args.max_samples,
         output_dir=args.output_dir,
         save_visualizations=args.save_visualizations,

@@ -305,6 +305,10 @@ else
     elif [ -f "${DATA_DIR}/BSDS_amodal_test.json" ]; then
         cp "${DATA_DIR}/BSDS_amodal_test.json" "${BSDS_ANN_JSON}"
         log_success "Located BSDS_amodal_test.json in data/bsds."
+    elif [ -f "$HOME/Downloads/annotations/BSDS_amodal_test.json" ]; then
+        mkdir -p "$(dirname "${BSDS_ANN_JSON}")"
+        cp "$HOME/Downloads/annotations/BSDS_amodal_test.json" "${BSDS_ANN_JSON}"
+        log_success "Copied BSDS_amodal_test.json from ~/Downloads/annotations."
     fi
 fi
 
