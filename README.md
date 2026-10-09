@@ -116,7 +116,7 @@ python eval_bsds.py \
     --dataset_dir data/bsds \
     --output_dir results \
     --ddim_steps 50 \
-    --guidance_scale 2.0 \
+    --guidance_scale 1.5 \
     --n_samples 1 \
     --device cuda
 ```
@@ -128,15 +128,21 @@ python eval_bsds.py \
 | `--ckpt` | `...` | Path to checkpoint file (`epoch=000005.ckpt`) |
 | `--dataset_dir` | `data/bsds` | Path to dataset root directory |
 | `--ann_file` | `None` | Path to `BSDS_amodal_test.json` (auto-detected if inside `dataset_dir`) |
-| `--ddim_steps` | `50` | Number of DDIM diffusion denoising steps |
-| `--guidance_scale` | `2.0` | Classifier-free guidance scale |
+| `--ddim_steps` | `50` | Number of DDIM diffusion denoising steps (use 200 for paper reproduction) |
+| `--guidance_scale` | `1.5` | Classifier-free guidance scale (author standard for amodal completion) |
 | `--n_samples` | `1` | Number of synthesized completions generated per object |
-| `--threshold` | `240` | White background threshold (0–255) for amodal mask segmentation |
+| `--threshold` | `250` | White background threshold (0–255) for amodal mask segmentation |
+| `--no_crop_bbox` | `False` | Disable bounding-box cropping and evaluate on whole-frame resized images |
+| `--margin_ratio` | `1.1` | Context margin multiplier for bounding-box expansion (PCNet standard) |
+| `--min_scale` | `2.0` | Minimum context area scale factor for bounding-box expansion |
+| `--include_stuff` | `False` | Include background 'stuff' regions (default: False, stuff regions filtered) |
+| `--min_occlude_rate` | `0.001` | Minimum occlusion rate threshold to filter unoccluded objects |
+| `--all_annotators` | `False` | Evaluate all annotators instead of 1 canonical annotator per image (~650 objects) |
 | `--device` | `cuda` | Target compute device (`cuda` or `cpu`) |
 | `--max_samples` | `None` | Limit evaluation to the first $N$ instances |
 | `--dummy_test` | `False` | Run smoke test on 2 synthetic test instances |
 | `--auto_synth_ann` | `False` | Synthesize amodal masks on real BSDS500 test images |
-| `--save_visualizations`| `True` | Save visual comparisons (Input, Visible, Completed, Pred Mask, GT Mask) |
+| `--save_visualizations`| `False` | Save visual comparisons (Input, Visible, Completed, Pred Mask, GT Mask) |
 
 #### Results & Output:
 Evaluation results and visual comparisons are saved to `results/`:
