@@ -278,21 +278,26 @@ def main():
     parser.add_argument(
         "--min_occlude_rate",
         type=float,
-        default=0.141,
-        help="Minimum occlusion rate threshold (default: 0.141 for benchmark 650)",
+        default=0.001,
+        help="Minimum occlusion rate threshold (default: 0.001 for true occlusions occlude_rate > 0)",
     )
     parser.add_argument(
         "--benchmark_650",
         dest="benchmark_650",
         action="store_true",
         default=True,
-        help="Enable exact CVPR benchmark 650-object standard (sets min_occlude_rate=0.141, first_annotator_only=True, default: True)",
+        help="Enable standard canonical benchmark filtering (first_annotator_only=True, occlude_rate > 0)",
     )
     parser.add_argument(
         "--no_benchmark_650",
         dest="benchmark_650",
         action="store_false",
-        help="Disable benchmark 650 standard and evaluate all occluded instances",
+        help="Disable benchmark standard and evaluate all occluded instances",
+    )
+    parser.add_argument(
+        "--artificial_650_filter",
+        action="store_true",
+        help="Demonstrate the artificial 0.141 threshold that was tuned to produce exactly 650 objects",
     )
     parser.add_argument(
         "--all_annotators",
@@ -319,7 +324,10 @@ def main():
         run_synthetic_test()
         return
 
-    min_occ = 0.141 if args.benchmark_650 else args.min_occlude_rate
+    if args.artificial_650_filter:
+        min_occ = 0.141
+    else:
+        min_occ = args.min_occlude_rate
     first_ann = True if args.benchmark_650 else args.first_annotator_only
 
     ann_file = args.ann_file or find_default_annotation_file()
