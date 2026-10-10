@@ -233,195 +233,107 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda", target_re
 
 
 # ==============================================================================
-# 2. Geometric Preprocessing: Bounding-Box Cropping & Canvas Uncropping
+# 2. Geometric Preprocessing: Square Object Cropping & Canvas Uncropping
 # ==============================================================================
-def mask_to_bbox(mask: np.ndarray) -> List[int]:
+def get_bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     """
-    Computes [x, y, w, h] bounding box from binary mask.
-    Returns full-frame bbox [0, 0, W, H] if mask is empty.
+    Computes [ymin, xmin, ymax, xmax] bounding box (exclusive ymax, xmax) from binary mask.
+    Returns None if mask is empty.
     """
     rows = np.any(mask, axis=1)
     cols = np.any(mask, axis=0)
     if not np.any(rows) or not np.any(cols):
-        h, w = mask.shape[:2]
-        return [0, 0, w, h]
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    return [int(cmin), int(rmin), int(cmax - cmin + 1), int(rmax - rmin + 1)]
+        return None
+    ymin, ymax = np.where(rows)[0][[0, -1]]
+    xmin, xmax = np.where(cols)[0][[0, -1]]
+    return int(ymin), int(xmin), int(ymax + 1), int(xmax + 1)
 
 
-def expand_bbox(
-    bbox: List[int],
-    margin_ratio: float = 1.1,
-    min_scale: float = 2.0,
-    min_size: int = 16,
-) -> List[int]:
-    """
-    Expands bounding box to a square region centered on the object with context margin,
-    following PCNet [49] / standard amodal completion protocols:
-    size = max(sqrt(w * h * min_scale), w * margin_ratio, h * margin_ratio)
-
-    Args:
-        bbox: [x, y, w, h]
-        margin_ratio: Minimum margin multiplier along width/height (default: 1.1).
-        min_scale: Area scaling factor for context (default: 2.0).
-        min_size: Minimum crop size in pixels (default: 16).
-
-    Returns:
-        [new_x, new_y, size, size]
-    """
-    x, y, w, h = bbox
-    cx = x + w / 2.0
-    cy = y + h / 2.0
-    size = max(np.sqrt(max(w * h * min_scale, 1.0)), w * margin_ratio, h * margin_ratio)
-    size = max(int(round(size)), min_size)
-    new_x = int(round(cx - size / 2.0))
-    new_y = int(round(cy - size / 2.0))
-    return [new_x, new_y, size, size]
-
-
-def crop_padding(img: np.ndarray, roi: List[int], pad_value: Any = 0) -> np.ndarray:
-    """
-    Crops roi [x, y, w, h] from img with padding if roi extends outside image canvas.
-
-    Args:
-        img: np.ndarray of shape (H, W) or (H, W, C).
-        roi: [x, y, w, h] crop coordinates.
-        pad_value: Fill value for regions outside canvas.
-
-    Returns:
-        np.ndarray of shape (h, w) or (h, w, C).
-    """
-    x, y, w, h = [int(v) for v in roi]
-    H, W = img.shape[:2]
-    is_2d = (img.ndim == 2)
-    if is_2d:
-        img_3d = img[:, :, np.newaxis]
-        pad_arr = [pad_value] if isinstance(pad_value, (int, float, bool)) else pad_value
-    else:
-        img_3d = img
-        if isinstance(pad_value, (int, float, bool)):
-            pad_arr = [pad_value] * img_3d.shape[2]
-        else:
-            pad_arr = pad_value
-
-    channels = img_3d.shape[2]
-    output = np.tile(np.array(pad_arr, dtype=img.dtype), (h, w, 1))
-
-    src_x1 = max(0, x)
-    src_y1 = max(0, y)
-    src_x2 = min(W, x + w)
-    src_y2 = min(H, y + h)
-
-    if src_x2 > src_x1 and src_y2 > src_y1:
-        dst_x1 = src_x1 - x
-        dst_y1 = src_y1 - y
-        dst_x2 = dst_x1 + (src_x2 - src_x1)
-        dst_y2 = dst_y1 + (src_y2 - src_y1)
-        output[dst_y1:dst_y2, dst_x1:dst_x2, :] = img_3d[src_y1:src_y2, src_x1:src_x2, :]
-
-    if is_2d:
-        return np.squeeze(output, axis=-1)
-    return output
-
-
-def uncrop_to_canvas(
-    pred_patch: np.ndarray,
-    roi: List[int],
+def compute_square_crop_coords(
+    ymin: int,
+    xmin: int,
+    ymax: int,
+    xmax: int,
     orig_h: int,
     orig_w: int,
-    interp: str = "linear",
-) -> np.ndarray:
+    margin_ratio: float = 1.1,
+    min_size: int = 16,
+) -> Tuple[int, Tuple[int, int, int, int], Tuple[int, int, int, int]]:
     """
-    Uncrops and pastes the predicted square patch back onto the full original canvas (orig_h, orig_w).
-
-    Args:
-        pred_patch: (P, P) or (P, P, C) predicted mask or image patch (e.g. 256x256 or 512x512).
-        roi: [x, y, size, size] coordinates of the crop.
-        orig_h: Height of full image canvas.
-        orig_w: Width of full image canvas.
-        interp: 'linear' or 'nearest' interpolation for resizing patch to size.
+    Computes square context window centered at target object and exact coordinate mappings.
 
     Returns:
-        Canvas of shape (orig_h, orig_w) with the patch pasted in place.
+        S: side length of square patch.
+        (src_y1, src_y2, src_x1, src_x2): coordinates within original image canvas.
+        (dst_y1, dst_y2, dst_x1, dst_x2): coordinates within square patch (S, S).
     """
-    x, y, size, _ = [int(v) for v in roi]
-    is_2d = (pred_patch.ndim == 2)
+    h_obj = max(ymax - ymin, 1)
+    w_obj = max(xmax - xmin, 1)
+    cy = (ymin + ymax) / 2.0
+    cx = (xmin + xmax) / 2.0
 
-    if is_2d:
-        if interp == "linear":
-            resized_patch = (
-                cv2.resize(pred_patch.astype(np.float32), (size, size), interpolation=cv2.INTER_LINEAR) >= 0.5
-            ).astype(np.uint8)
-        else:
-            resized_patch = cv2.resize(pred_patch.astype(np.uint8), (size, size), interpolation=cv2.INTER_NEAREST)
-        canvas = np.zeros((orig_h, orig_w), dtype=np.uint8)
-    else:
-        resized_patch = cv2.resize(pred_patch, (size, size), interpolation=cv2.INTER_LANCZOS4)
-        canvas = np.zeros((orig_h, orig_w, pred_patch.shape[2]), dtype=pred_patch.dtype)
+    S = max(int(round(max(h_obj, w_obj) * margin_ratio)), min_size)
+    y1 = int(round(cy - S / 2.0))
+    y2 = y1 + S
+    x1 = int(round(cx - S / 2.0))
+    x2 = x1 + S
 
-    dst_x1 = max(0, x)
-    dst_y1 = max(0, y)
-    dst_x2 = min(orig_w, x + size)
-    dst_y2 = min(orig_h, y + size)
+    src_y1 = max(0, y1)
+    src_y2 = min(orig_h, y2)
+    src_x1 = max(0, x1)
+    src_x2 = min(orig_w, x2)
 
-    src_x1 = max(0, -x)
-    src_y1 = max(0, -y)
-    src_x2 = src_x1 + (dst_x2 - dst_x1)
-    src_y2 = src_y1 + (dst_y2 - dst_y1)
+    dst_y1 = src_y1 - y1
+    dst_y2 = dst_y1 + (src_y2 - src_y1)
+    dst_x1 = src_x1 - x1
+    dst_x2 = dst_x1 + (src_x2 - src_x1)
 
-    if dst_x2 > dst_x1 and dst_y2 > dst_y1:
-        if is_2d:
-            canvas[dst_y1:dst_y2, dst_x1:dst_x2] = resized_patch[src_y1:src_y2, src_x1:src_x2]
-        else:
-            canvas[dst_y1:dst_y2, dst_x1:dst_x2] = resized_patch[src_y1:src_y2, src_x1:src_x2]
-
-    if is_2d:
-        return canvas > 0
-    return canvas
+    return S, (src_y1, src_y2, src_x1, src_x2), (dst_y1, dst_y2, dst_x1, dst_x2)
 
 
 # ==============================================================================
 # 3. Robust Mask Extraction & Post-Processing Logic
 # ==============================================================================
-def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+def fill_enclosed_holes(mask: np.ndarray) -> np.ndarray:
     """
-    Fills internal holes in a binary mask using flood-fill from canvas borders on inverted mask.
+    Fills internal holes enclosed within foreground contours.
+    Does NOT perform flood-fill from canvas borders, guaranteeing no exterior leakage.
     """
-    h, w = mask.shape[:2]
-    inv = (mask == 0).astype(np.uint8)
-    padded = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    padded[1:h + 1, 1:w + 1] = inv
-    flood_mask = np.zeros((h + 4, w + 4), dtype=np.uint8)
-    cv2.floodFill(padded, flood_mask, (0, 0), 2)
-    # Regions that remained 1 are internal holes
-    holes = (padded[1:h + 1, 1:w + 1] == 1)
-    return np.logical_or(mask > 0, holes).astype(np.uint8)
+    bin_mask = (mask > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(bin_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(bin_mask)
+    cv2.drawContours(filled, contours, -1, 1, thickness=-1)
+    return filled
 
 
 def extract_amodal_mask(
     sample_img: np.ndarray,
     visible_mask_patch: Optional[np.ndarray] = None,
-    threshold: int = 250,
+    distance_threshold: float = 15.0,
     fill_holes: bool = True,
     preserve_visible: bool = True,
 ) -> np.ndarray:
     """
-    Robust extraction of amodal segmentation mask from synthesized diffusion completion.
+    Safe distance-based thresholding on pure white canvas [255, 255, 255]
+    with enclosed hole-filling and modal mask preservation.
 
-    The pix2gestalt model synthesizes the whole completed object on a pure white background.
-    Direct naive thresholding (gray < threshold) causes:
-    1. Severe hole artifacts on bright/white object surfaces and specular highlights.
-    2. Zero IoU on white/light-colored target objects.
-    3. Failure to remove external diffusion noise.
+    pix2gestalt synthesizes completed amodal objects on pure white background [255, 255, 255].
+    Previous exterior flood-fill frequently leaked into light/bright objects and objects touching
+    crop borders, destroying object masks down to near-zero IoU.
 
-    This function applies author-aligned multi-stage robust post-processing:
-    1. Alpha channel check (if output has an alpha channel from matting).
-    2. Multi-channel perceptual color distance from white background [255, 255, 255].
-    3. Exterior background flood-fill from canvas borders to protect interior bright regions.
-    4. Morphological hole filling to eliminate surface voids.
-    5. Union with visible modal mask (amodal extent is strictly a superset of modal extent).
-    6. Connected-component filtering to retain object components connected to the visible mask.
+    This function applies author-aligned robust post-processing:
+    1. Alpha channel check (if sample contains alpha from matting).
+    2. Safe Euclidean color distance from pure white: diff = norm(255 - rgb) > distance_threshold.
+    3. Enclosed contour hole-filling: fills internal surface voids without leaking outside borders.
+    4. Modal mask preservation: guarantees amodal prediction contains the visible modal mask.
+    5. Connected component filtering: prunes stray diffusion artifacts disconnected from the object.
+
+    Args:
+        sample_img: Synthesized RGB uint8 image of shape (H, W, 3) or RGBA (H, W, 4).
+        visible_mask_patch: Visible modal mask for this patch (H, W) in {0, 1}.
+        distance_threshold: Euclidean distance from pure white threshold (default: 15.0).
+        fill_holes: Whether to fill enclosed internal holes (default: True).
+        preserve_visible: Whether to preserve visible modal mask (default: True).
 
     Returns:
         np.ndarray: Binary mask of shape (H, W), dtype uint8 {0, 1}.
@@ -437,41 +349,22 @@ def extract_amodal_mask(
     else:
         rgb = sample_img[:, :, :3]
 
-    h, w = rgb.shape[:2]
+    # 2. Safe Euclidean distance from pure white canvas [255, 255, 255]
+    diff_from_white = np.linalg.norm(255.0 - rgb.astype(np.float32), axis=-1)
+    mask = (diff_from_white > distance_threshold).astype(np.uint8)
 
-    # 2. Multi-channel color distance from white background [255, 255, 255]
-    diff_from_white = 255.0 - rgb.astype(np.float32)
-    max_channel_diff = np.max(diff_from_white, axis=-1)  # max deviation across R, G, B
-
-    # Margin allowed for white background synthesis noise
-    bg_delta = max(255 - threshold, 5.0)
-
-    # Near-white pixels (potential background)
-    is_near_white = (max_channel_diff <= bg_delta).astype(np.uint8)
-
-    # 3. Exterior background flood-fill from canvas borders
-    # Interior white parts of the object are isolated from the canvas borders by the object boundary
-    padded = np.ones((h + 2, w + 2), dtype=np.uint8)
-    padded[1:h + 1, 1:w + 1] = is_near_white
-    flood_mask = np.zeros((h + 4, w + 4), dtype=np.uint8)
-    cv2.floodFill(padded, flood_mask, (0, 0), 2)
-    exterior_bg = (padded[1:h + 1, 1:w + 1] == 2)
-
-    # Initial foreground is everything that is NOT exterior background
-    mask = (~exterior_bg).astype(np.uint8)
-
-    # 4. Morphological hole filling
+    # 3. Enclosed hole filling (safe, no exterior floodfill)
     if fill_holes:
-        mask = fill_mask_holes(mask)
+        mask = fill_enclosed_holes(mask)
 
-    # 5. Modal / visible mask preservation:
-    # An object's amodal extent must contain its visible modal extent
+    # 4. Modal / visible mask preservation:
+    # An object's amodal extent must strictly contain its visible modal extent
     if preserve_visible and visible_mask_patch is not None:
         vis_bin = (visible_mask_patch > 0).astype(np.uint8)
-        mask = np.logical_or(mask > 0, vis_bin > 0).astype(np.uint8)
+        mask = np.maximum(mask, vis_bin)
 
-    # 6. Connected component filtering:
-    # Filter out spurious disconnected noise in canvas corners
+    # 5. Connected component filtering:
+    # Filter out spurious disconnected noise that does not overlap with the visible mask
     if visible_mask_patch is not None and np.any(visible_mask_patch > 0):
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
         if num_labels > 2:  # 0 is background, >1 foreground components
@@ -583,6 +476,7 @@ def predict_amodal_mask(
     ddim_steps: int = 50,
     n_samples: int = 1,
     guidance_scale: float = 1.5,
+    distance_threshold: float = 15.0,
     threshold: int = 250,
     precision: str = "autocast",
     crop_bbox: bool = True,
@@ -593,22 +487,29 @@ def predict_amodal_mask(
     """
     Takes original RGB image and visible modal mask, predicts full amodal mask.
 
-    When crop_bbox=True (author & PCNet [49] benchmark standard):
-    1. Computes bounding box around the visible object with context margin.
-    2. Crops a square context patch, resizes it to target resolution (256x256 or 512x512).
-    3. Runs diffusion model on the object patch.
-    4. Extracts amodal mask via robust post-processing (preventing white object holes).
-    5. Uncrops and pastes predicted amodal mask back onto original canvas.
+    When crop_bbox=True (author & benchmark standard):
+    1. Computes target object bounding box [ymin, xmin, ymax, xmax].
+    2. Centers square context patch of side S with white padding [255, 255, 255] outside canvas.
+    3. Resizes patch to model resolution (256x256 or 512x512).
+    4. Runs diffusion model on the object patch.
+    5. Extracts amodal mask via robust Euclidean color distance from pure white and enclosed hole-filling.
+    6. Uncrops predicted amodal mask back onto original canvas with exact spatial alignment.
 
     Args:
         model: pix2gestalt diffusion model.
         sampler: DDIMSampler instance.
         image_rgb: Original RGB image (H, W, 3) in [0, 255].
         visible_mask: Visible modal mask (H, W) in {0, 255} or boolean.
-        threshold: Intensity threshold for white background separation (default: 250).
-        crop_bbox: Whether to use standard object-centric bounding-box cropping (default: True).
+        device: Device to run inference on.
+        ddim_steps: Number of DDIM sampling steps (default: 50).
+        n_samples: Number of samples per object (default: 1).
+        guidance_scale: Classifier-free guidance scale (default: 1.5).
+        distance_threshold: Euclidean distance threshold from white [255, 255, 255] (default: 15.0).
+        threshold: Legacy threshold parameter (default: 250).
+        precision: Inference precision ('autocast' or 'fp32').
+        crop_bbox: Whether to use square context bounding-box cropping (default: True).
         margin_ratio: Context margin multiplier (default: 1.1).
-        min_scale: Context area scaling factor (default: 2.0).
+        min_scale: Unused context scale factor retained for CLI compatibility.
         resolution: Target patch resolution for diffusion model (default: 256; supports 512).
 
     Returns:
@@ -620,29 +521,41 @@ def predict_amodal_mask(
 
     # Format visible mask as binary 2D mask
     if visible_mask.ndim == 3:
-        vis_mask_2d = visible_mask.any(axis=-1)
+        vis_mask_2d = visible_mask.any(axis=-1).astype(np.uint8)
     else:
-        vis_mask_2d = visible_mask
-    vis_mask_2d = (vis_mask_2d > 0).astype(np.uint8)
+        vis_mask_2d = (visible_mask > 0).astype(np.uint8)
 
-    if crop_bbox and np.any(vis_mask_2d > 0):
-        # 1. Compute object bounding box and expand with context margin
-        bbox = mask_to_bbox(vis_mask_2d)
-        exp_bbox = expand_bbox(bbox, margin_ratio=margin_ratio, min_scale=min_scale)
+    bbox = get_bbox_from_mask(vis_mask_2d) if np.any(vis_mask_2d > 0) else None
 
-        # 2. Crop image (pad with neutral gray 128) and mask (pad with 0)
-        img_crop = crop_padding(image_rgb, exp_bbox, pad_value=128)
-        mask_crop = crop_padding(vis_mask_2d, exp_bbox, pad_value=0)
+    if crop_bbox and bbox is not None:
+        ymin, xmin, ymax, xmax = bbox
+        S, (src_y1, src_y2, src_x1, src_x2), (dst_y1, dst_y2, dst_x1, dst_x2) = compute_square_crop_coords(
+            ymin=ymin,
+            xmin=xmin,
+            ymax=ymax,
+            xmax=xmax,
+            orig_h=orig_h,
+            orig_w=orig_w,
+            margin_ratio=margin_ratio,
+        )
 
-        # 3. Resize square patch to model resolution
-        img_patch = cv2.resize(img_crop, (resolution, resolution), interpolation=cv2.INTER_AREA)
-        mask_patch = cv2.resize(mask_crop, (resolution, resolution), interpolation=cv2.INTER_NEAREST)
+        # Pad square patch with pure white [255, 255, 255] for image (matches model synthesized background)
+        # and 0 for mask
+        crop_sq = np.full((S, S, 3), 255, dtype=np.uint8)
+        mask_sq = np.zeros((S, S), dtype=np.uint8)
+
+        crop_sq[dst_y1:dst_y2, dst_x1:dst_x2] = image_rgb[src_y1:src_y2, src_x1:src_x2]
+        mask_sq[dst_y1:dst_y2, dst_x1:dst_x2] = vis_mask_2d[src_y1:src_y2, src_x1:src_x2]
+
+        # Resize square patch to diffusion model resolution
+        img_patch = cv2.resize(crop_sq, (resolution, resolution), interpolation=cv2.INTER_AREA)
+        mask_patch = cv2.resize(mask_sq, (resolution, resolution), interpolation=cv2.INTER_NEAREST)
 
         rgb_mask_patch = np.stack([mask_patch * 255] * 3, axis=-1)
         input_tensor = process_input_tensor(img_patch, (resolution, resolution))
         mask_tensor = process_input_tensor(rgb_mask_patch, (resolution, resolution))
 
-        # 4. Run diffusion model
+        # Run diffusion model
         samples = sample_pix2gestalt(
             model=model,
             sampler=sampler,
@@ -657,13 +570,13 @@ def predict_amodal_mask(
             precision=precision,
         )
 
-        # 5. Extract amodal mask on square patch
+        # Extract amodal mask on square patch for each sample
         sample_masks_patch = []
         for s in samples:
             m_patch = extract_amodal_mask(
                 s,
                 visible_mask_patch=mask_patch,
-                threshold=threshold,
+                distance_threshold=distance_threshold,
                 fill_holes=True,
                 preserve_visible=True,
             )
@@ -674,16 +587,18 @@ def predict_amodal_mask(
         else:
             voted_mask_patch = sample_masks_patch[0]
 
-        # 6. Uncrop predicted mask back onto original canvas
-        pred_mask_orig = uncrop_to_canvas(voted_mask_patch, exp_bbox, orig_h, orig_w, interp="linear")
+        # Resize predicted mask back to (S, S) using NEAREST interpolation to preserve clean binary edges
+        pred_sq = cv2.resize(voted_mask_patch, (S, S), interpolation=cv2.INTER_NEAREST)
+        pred_crop = pred_sq[dst_y1:dst_y2, dst_x1:dst_x2]
 
-        # 7. Uncrop completed image and composite over original canvas
-        completed_patch_canvas = uncrop_to_canvas(samples[0], exp_bbox, orig_h, orig_w, interp="linear")
-        crop_mask_full = uncrop_to_canvas(
-            np.ones((resolution, resolution), dtype=np.uint8), exp_bbox, orig_h, orig_w, interp="nearest"
-        )
+        # Uncrop back to original canvas
+        pred_mask_orig = np.zeros((orig_h, orig_w), dtype=bool)
+        pred_mask_orig[src_y1:src_y2, src_x1:src_x2] = (pred_crop > 0)
+
+        # Uncrop completed image and composite over original canvas
+        completed_sq = cv2.resize(samples[0], (S, S), interpolation=cv2.INTER_LANCZOS4)
         completed_image_orig = image_rgb.copy()
-        completed_image_orig[crop_mask_full] = completed_patch_canvas[crop_mask_full]
+        completed_image_orig[src_y1:src_y2, src_x1:src_x2] = completed_sq[dst_y1:dst_y2, dst_x1:dst_x2]
 
     else:
         # Whole-frame resizing fallback (if crop_bbox=False or visible mask is empty)
@@ -706,11 +621,12 @@ def predict_amodal_mask(
         )
 
         sample_masks = []
+        vis_patch = cv2.resize(vis_mask_2d, (resolution, resolution), interpolation=cv2.INTER_NEAREST)
         for s in samples:
             m = extract_amodal_mask(
                 s,
-                visible_mask_patch=cv2.resize(vis_mask_2d, (resolution, resolution), interpolation=cv2.INTER_NEAREST),
-                threshold=threshold,
+                visible_mask_patch=vis_patch,
+                distance_threshold=distance_threshold,
                 fill_holes=True,
                 preserve_visible=True,
             )
@@ -773,20 +689,24 @@ class BSDSADataset:
         auto_synth_ann: bool = False,
         ignore_stuff: bool = True,
         filter_occluded: bool = True,
-        min_occlude_rate: float = 0.001,
+        min_occlude_rate: float = 0.141,
         first_annotator_only: bool = True,
         target_author: Optional[str] = None,
-        benchmark_650: bool = False,
+        benchmark_650: bool = True,
     ):
         self.items = []
         self.dummy_test = dummy_test
         self.auto_synth_ann = auto_synth_ann
         self.ignore_stuff = ignore_stuff
         self.filter_occluded = filter_occluded
-        self.min_occlude_rate = 0.141 if benchmark_650 else min_occlude_rate
-        self.first_annotator_only = True if benchmark_650 else first_annotator_only
-        self.target_author = target_author
         self.benchmark_650 = benchmark_650
+        if benchmark_650:
+            self.min_occlude_rate = 0.141
+            self.first_annotator_only = True
+        else:
+            self.min_occlude_rate = min_occlude_rate
+            self.first_annotator_only = first_annotator_only
+        self.target_author = target_author
 
         if dummy_test:
             self._init_dummy_samples()
@@ -1232,6 +1152,7 @@ def evaluate(
     n_samples: int = 1,
     guidance_scale: float = 1.5,
     precision: str = "autocast",
+    distance_threshold: float = 15.0,
     threshold: int = 250,
     crop_bbox: bool = True,
     margin_ratio: float = 1.1,
@@ -1265,8 +1186,8 @@ def evaluate(
     print("\n" + "=" * 60)
     print(f"STARTING BSDS-A BENCHMARK EVALUATION ({num_items} objects)")
     print(f"Device: {device} | DDIM Steps: {ddim_steps} | Samples: {n_samples} | Guidance: {guidance_scale}")
-    print(f"Resolution: {resolution}x{resolution} | Crop BBox: {crop_bbox} (margin: {margin_ratio}, min_scale: {min_scale})")
-    print(f"Threshold: {threshold} (Robust Multi-channel + Flood-Fill)")
+    print(f"Resolution: {resolution}x{resolution} | Crop BBox: {crop_bbox} (margin: {margin_ratio})")
+    print(f"Threshold Method: Euclidean Color Distance ({distance_threshold}) + Enclosed Hole Filling")
     print("=" * 60 + "\n")
 
     per_instance_results = []
@@ -1293,6 +1214,7 @@ def evaluate(
             ddim_steps=ddim_steps,
             n_samples=n_samples,
             guidance_scale=guidance_scale,
+            distance_threshold=distance_threshold,
             threshold=threshold,
             precision=precision,
             crop_bbox=crop_bbox,
@@ -1355,8 +1277,8 @@ Settings:
   - Checkpoint          : {ckpt_path}
   - Config              : {config_path}
   - Resolution          : {resolution}x{resolution}
-  - Crop BBox Preprocess: {crop_bbox} (margin: {margin_ratio}, min_scale: {min_scale})
-  - Threshold Method    : Robust Multi-channel + Exterior Floodfill ({threshold})
+  - Crop BBox Preprocess: {crop_bbox} (margin: {margin_ratio})
+  - Threshold Method    : Euclidean Color Distance ({distance_threshold}) + Enclosed Hole Filling
   - DDIM Steps          : {ddim_steps}
   - Number of Samples   : {n_samples}
   - Guidance Scale      : {guidance_scale}
@@ -1384,6 +1306,7 @@ Settings:
                 "n_samples": n_samples,
                 "guidance_scale": guidance_scale,
                 "precision": precision,
+                "distance_threshold": distance_threshold,
                 "threshold": threshold,
                 "crop_bbox": crop_bbox,
                 "margin_ratio": margin_ratio,
@@ -1481,6 +1404,12 @@ def main():
         help="Inference precision (autocast or fp32)",
     )
     parser.add_argument(
+        "--distance_threshold",
+        type=float,
+        default=15.0,
+        help="Euclidean color distance threshold from white [255, 255, 255] (default: 15.0)",
+    )
+    parser.add_argument(
         "--threshold",
         type=int,
         default=250,
@@ -1522,13 +1451,21 @@ def main():
     parser.add_argument(
         "--min_occlude_rate",
         type=float,
-        default=0.001,
-        help="Minimum occlusion rate threshold to filter unoccluded objects (default: 0.001)",
+        default=0.141,
+        help="Minimum occlusion rate threshold to filter unoccluded objects (default: 0.141 for benchmark 650)",
     )
     parser.add_argument(
         "--benchmark_650",
+        dest="benchmark_650",
         action="store_true",
-        help="Enable exact CVPR benchmark 650-object standard (sets min_occlude_rate=0.141, first_annotator_only=True)",
+        default=True,
+        help="Enable exact CVPR benchmark 650-object standard (sets min_occlude_rate=0.141, first_annotator_only=True, default: True)",
+    )
+    parser.add_argument(
+        "--no_benchmark_650",
+        dest="benchmark_650",
+        action="store_false",
+        help="Disable benchmark 650 standard and evaluate all occluded instances",
     )
     parser.add_argument(
         "--all_annotators",
@@ -1598,6 +1535,7 @@ def main():
         n_samples=args.n_samples,
         guidance_scale=args.guidance_scale,
         precision=args.precision,
+        distance_threshold=args.distance_threshold,
         threshold=args.threshold,
         crop_bbox=args.crop_bbox,
         margin_ratio=args.margin_ratio,

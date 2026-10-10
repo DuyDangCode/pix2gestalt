@@ -278,13 +278,21 @@ def main():
     parser.add_argument(
         "--min_occlude_rate",
         type=float,
-        default=0.001,
-        help="Minimum occlusion rate threshold (default: 0.001)",
+        default=0.141,
+        help="Minimum occlusion rate threshold (default: 0.141 for benchmark 650)",
     )
     parser.add_argument(
         "--benchmark_650",
+        dest="benchmark_650",
         action="store_true",
-        help="Enable exact CVPR benchmark 650-object standard (sets min_occlude_rate=0.141, first_annotator_only=True)",
+        default=True,
+        help="Enable exact CVPR benchmark 650-object standard (sets min_occlude_rate=0.141, first_annotator_only=True, default: True)",
+    )
+    parser.add_argument(
+        "--no_benchmark_650",
+        dest="benchmark_650",
+        action="store_false",
+        help="Disable benchmark 650 standard and evaluate all occluded instances",
     )
     parser.add_argument(
         "--all_annotators",
