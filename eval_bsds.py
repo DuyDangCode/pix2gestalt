@@ -115,15 +115,30 @@ from ldm.util import instantiate_from_config
 # ==============================================================================
 def get_precision_scope(precision: str, device: str):
     """Returns safe autocast scope for CUDA or nullcontext for CPU/fp32."""
-    if precision == "autocast" and torch.cuda.is_available() and "cuda" in str(device).lower():
+    if precision in ("autocast", "fp16", "half") and torch.cuda.is_available() and "cuda" in str(device).lower():
         try:
-            return torch.cuda.amp.autocast(enabled=True)
-        except Exception:
-            return torch.autocast(device_type="cuda", enabled=True)
+            # Modern PyTorch 2.x API (suppresses FutureWarning)
+            return torch.amp.autocast("cuda", dtype=torch.float16, enabled=True)
+        except (AttributeError, TypeError):
+            try:
+                return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+            except Exception:
+                return torch.cuda.amp.autocast(enabled=True)
+    elif precision == "bf16" and torch.cuda.is_available() and "cuda" in str(device).lower():
+        try:
+            return torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True)
+        except (AttributeError, TypeError):
+            return torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True)
     return nullcontext()
 
 
-def load_model(config_path: str, ckpt_path: str, device: str = "cuda", target_resolution: int = 256) -> torch.nn.Module:
+def load_model(
+    config_path: str,
+    ckpt_path: str,
+    device: str = "cuda",
+    target_resolution: int = 256,
+    half_precision: bool = False,
+) -> torch.nn.Module:
     """
     Loads pix2gestalt model architecture from config and restores checkpoint weights.
 
@@ -225,9 +240,38 @@ def load_model(config_path: str, ckpt_path: str, device: str = "cuda", target_re
     import gc
     gc.collect()
 
+    # EMA Shadow Weight Optimization:
+    # During evaluation/inference, we evaluate using the trained EMA weights.
+    # In standard training, LitEma keeps shadow buffers of the entire UNet (~3.44 GB)
+    # and model.ema_scope() dynamically clones all UNet parameters on GPU (another ~3.44 GB).
+    # By copying the EMA weights directly into model.model on CPU and deleting model.model_ema,
+    # we permanently retain the official EMA weights while freeing ~6.88 GB of redundant GPU VRAM!
+    if hasattr(model, "model_ema") and model.model_ema is not None:
+        print("[Model] Applying EMA shadow weights to UNet parameters...")
+        model.model_ema.copy_to(model.model)
+        print("[Model] Freeing EMA shadow buffers to save ~6.88 GB GPU VRAM...")
+        del model.model_ema
+        model.model_ema = None
+        model.use_ema = False
+        gc.collect()
+
     print(f"[Model] Transferring model to target device: {device}...")
     model.to(device)
+
+    # Optional half precision conversion (for lower VRAM GPUs < 12GB)
+    if half_precision and "cuda" in str(device).lower():
+        print("[Model] Converting UNet and conditioning model to half precision (fp16)...")
+        if hasattr(model, "model"):
+            model.model.half()
+        if hasattr(model, "cond_stage_model"):
+            model.cond_stage_model.half()
+        if hasattr(model, "cc_projection"):
+            model.cc_projection.half()
+        # Keep first_stage_model (VAE) in float32 for numerical stability.
+
     model.eval()
+    if torch.cuda.is_available() and "cuda" in str(device).lower():
+        torch.cuda.empty_cache()
     print("[Model] Model successfully loaded and set to eval mode.")
     return model
 
@@ -405,25 +449,28 @@ def sample_pix2gestalt(
         List of np.ndarray: Each sample is an RGB uint8 image of shape (h, w, 3).
     """
     precision_scope = get_precision_scope(precision, device)
+    dev = torch.device(device)
+    input_tensor = input_tensor.to(dev)
+    mask_tensor = mask_tensor.to(dev)
 
     with precision_scope:
         with model.ema_scope():
             cond = {}
             # Channel 1: CLIP embedding of input image
-            clip_emb = model.get_learned_conditioning(input_tensor.to(device)).tile(n_samples, 1, 1)
+            clip_emb = model.get_learned_conditioning(input_tensor).tile(n_samples, 1, 1)
             c = model.cc_projection(clip_emb)
             cond["c_crossattn"] = [c]
 
             # Channel 2: VAE latent of input image concatenated with VAE latent of visible mask
-            input_enc = model.encode_first_stage(input_tensor.to(device)).mode().detach()
-            mask_enc = model.encode_first_stage(mask_tensor.to(device)).mode().detach()
+            input_enc = model.encode_first_stage(input_tensor).mode().detach()
+            mask_enc = model.encode_first_stage(mask_tensor).mode().detach()
             c_concat = torch.cat((input_enc, mask_enc), dim=1)
             cond["c_concat"] = [c_concat.repeat(n_samples, 1, 1, 1)]
 
             if guidance_scale != 1.0:
                 uc = {
-                    "c_crossattn": [torch.zeros_like(c).to(device)],
-                    "c_concat": [torch.zeros(n_samples, 8, h // 8, w // 8).to(device)],
+                    "c_crossattn": [torch.zeros_like(c).to(dev)],
+                    "c_concat": [torch.zeros(n_samples, 8, h // 8, w // 8, device=dev, dtype=c_concat.dtype)],
                 }
             else:
                 uc = None
@@ -441,13 +488,21 @@ def sample_pix2gestalt(
                 x_T=None,
             )
 
-            x_samples = model.decode_first_stage(samples_ddim)
+            # Ensure VAE decoding receives float32 tensor to prevent half-precision overflow/underflow
+            samples_ddim_f = samples_ddim.float() if hasattr(samples_ddim, "float") else samples_ddim
+            x_samples = model.decode_first_stage(samples_ddim_f)
             x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0).cpu()
 
             output_ims = []
             for sample in x_samples:
                 arr = 255.0 * rearrange(sample.numpy(), "c h w -> h w c")
                 output_ims.append(arr.astype(np.uint8))
+
+            # Free intermediate GPU allocations
+            del samples_ddim, samples_ddim_f, cond, uc, c, clip_emb, input_enc, mask_enc, c_concat, x_samples
+            if torch.cuda.is_available() and "cuda" in str(device).lower():
+                torch.cuda.empty_cache()
+
             return output_ims
 
 
@@ -1131,9 +1186,10 @@ def evaluate(
     n_samples: int = 1,
     guidance_scale: float = 1.5,
     precision: str = "autocast",
-    distance_threshold: float = 15.0,
+    half: bool = False,
+    distance_threshold: Optional[float] = None,
     threshold: int = 250,
-    crop_bbox: bool = True,
+    crop_bbox: bool = False,
     margin_ratio: float = 1.1,
     min_scale: float = 2.0,
     resolution: int = 256,
@@ -1143,7 +1199,7 @@ def evaluate(
 ) -> Dict[str, Any]:
     """
     Main evaluation routine:
-    1. Loads the pix2gestalt model and DDIM sampler.
+    1. Loads the pix2gestalt model and DDIM sampler with EMA & VRAM optimizations.
     2. Runs inference over benchmark objects using object-centric cropping & uncropping.
     3. Evaluates IoU against ground-truth amodal masks.
     4. Logs real-time progress and summary statistics.
@@ -1154,8 +1210,15 @@ def evaluate(
         vis_dir = os.path.join(output_dir, "vis")
         os.makedirs(vis_dir, exist_ok=True)
 
-    # 1. Load Model and Sampler with resolution verification
-    model = load_model(config_path, ckpt_path, device=device, target_resolution=resolution)
+    # 1. Load Model and Sampler with resolution verification and memory optimizations
+    half_precision = (half or precision in ("fp16", "half"))
+    model = load_model(
+        config_path,
+        ckpt_path,
+        device=device,
+        target_resolution=resolution,
+        half_precision=half_precision,
+    )
     sampler = DDIMSampler(model)
 
     num_items = len(dataset)
@@ -1245,6 +1308,10 @@ def evaluate(
             composite_bgr = cv2.cvtColor(composite, cv2.COLOR_RGB2BGR)
             vis_path = os.path.join(output_dir, "vis", f"{i:04d}_{os.path.splitext(img_name)[0]}_iou_{iou:.3f}.png")
             cv2.imwrite(vis_path, composite_bgr)
+
+        # Periodic GPU memory cleanup across long benchmark runs
+        if torch.cuda.is_available() and "cuda" in str(device).lower() and (i + 1) % 10 == 0:
+            torch.cuda.empty_cache()
 
     total_time = time.time() - start_time
     miou = float(np.mean(ious)) if len(ious) > 0 else 0.0
@@ -1396,8 +1463,16 @@ def main():
         "--precision",
         type=str,
         default="autocast",
-        choices=["autocast", "fp32"],
-        help="Inference precision (autocast or fp32)",
+        choices=["autocast", "fp32", "fp16", "half"],
+        help="Inference precision (autocast, fp32, or fp16/half)",
+    )
+    parser.add_argument(
+        "--half",
+        "--fp16",
+        dest="half",
+        action="store_true",
+        default=False,
+        help="Convert UNet and conditioning model to half precision (fp16) for lower VRAM usage (< 12GB)",
     )
     parser.add_argument(
         "--distance_threshold",
@@ -1537,6 +1612,7 @@ def main():
         n_samples=args.n_samples,
         guidance_scale=args.guidance_scale,
         precision=args.precision,
+        half=args.half,
         distance_threshold=args.distance_threshold,
         threshold=args.threshold,
         crop_bbox=args.crop_bbox,

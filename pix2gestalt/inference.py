@@ -18,9 +18,9 @@ def load_model_from_config(config, ckpt, device, verbose=False):
 
     print(f"Loading model from {ckpt}")
     try:
-        pl_sd = torch.load(ckpt, map_location=device, weights_only=False)
+        pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     except TypeError:
-        pl_sd = torch.load(ckpt, map_location=device)
+        pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
     sd = pl_sd["state_dict"]
@@ -32,15 +32,31 @@ def load_model_from_config(config, ckpt, device, verbose=False):
     if len(u) > 0 and verbose:
         print("unexpected keys:")
         print(u)
+    del pl_sd
+    del sd
+    gc.collect()
+
+    if hasattr(model, "model_ema") and model.model_ema is not None:
+        model.model_ema.copy_to(model.model)
+        del model.model_ema
+        model.model_ema = None
+        model.use_ema = False
+        gc.collect()
+
     model.to(device)
     model.eval()
+    if torch.cuda.is_available() and "cuda" in str(device).lower():
+        torch.cuda.empty_cache()
     return model
 
 @torch.no_grad()
 def sample_model(input_im, visible_mask, model, sampler, precision, h, w, ddim_steps, n_samples, scale, \
                  ddim_eta):
-    if precision == "autocast" and torch.cuda.is_available():
-        precision_scope = torch.cuda.amp.autocast(enabled=True)
+    if precision in ("autocast", "fp16", "half") and torch.cuda.is_available():
+        try:
+            precision_scope = torch.amp.autocast("cuda", dtype=torch.float16, enabled=True)
+        except (AttributeError, TypeError):
+            precision_scope = torch.cuda.amp.autocast(enabled=True)
     else:
         precision_scope = nullcontext()
     with precision_scope:
