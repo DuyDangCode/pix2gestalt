@@ -436,9 +436,9 @@ def sample_pix2gestalt(
     device: str,
     h: int = 256,
     w: int = 256,
-    ddim_steps: int = 50,
-    n_samples: int = 1,
-    guidance_scale: float = 1.5,
+    ddim_steps: int = 200,
+    n_samples: int = 3,
+    guidance_scale: float = 2.0,
     ddim_eta: float = 1.0,
     precision: str = "autocast",
 ) -> List[np.ndarray]:
@@ -512,9 +512,9 @@ def predict_amodal_mask(
     image_rgb: np.ndarray,
     visible_mask: np.ndarray,
     device: str = "cuda",
-    ddim_steps: int = 50,
-    n_samples: int = 1,
-    guidance_scale: float = 1.5,
+    ddim_steps: int = 200,
+    n_samples: int = 3,
+    guidance_scale: float = 2.0,
     distance_threshold: Optional[float] = None,
     threshold: int = 250,
     precision: str = "autocast",
@@ -654,18 +654,20 @@ def predict_amodal_mask(
 
         all_sample_masks = []
         for s in samples:
-            # Resize completed image to original canvas using Lanczos4 (matches app.py line 177)
-            completed_s = cv2.resize(s, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
-            # Direct thresholding at threshold 250 (matches app.py line 154)
-            m = extract_amodal_mask(
-                completed_s,
-                visible_mask_patch=vis_mask_2d,
+            # Direct thresholding on native 256x256 diffusion output (matches app.py line 154 without Lanczos background ringing)
+            m_256 = extract_amodal_mask(
+                s,
+                visible_mask_patch=vis_patch,
                 threshold=threshold,
                 preserve_visible=True,
                 distance_threshold=distance_threshold,
                 fill_holes=False,
             )
-            all_sample_masks.append(m > 0)
+            # Resize clean binary mask to original canvas
+            m = cv2.resize(m_256.astype(np.uint8), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST) > 0
+            # Ensure visible modal mask is strictly preserved on original canvas
+            m = np.maximum(m.astype(np.uint8), vis_mask_2d.astype(np.uint8)) > 0
+            all_sample_masks.append(m)
 
         if len(all_sample_masks) > 1:
             pred_mask_orig = (np.mean(np.stack(all_sample_masks, axis=0), axis=0) >= 0.5)
@@ -734,13 +736,16 @@ class BSDSADataset:
         self.ignore_stuff = ignore_stuff
         self.filter_occluded = filter_occluded
         self.benchmark_650 = benchmark_650
-        # Standard benchmark evaluation selects 1 canonical annotator per image
-        # and filters out unoccluded objects (occlude_rate > 0).
-        # NOTE: min_occlude_rate=0.141 was an artificial filter that suppressed
-        # modal baseline IoU down to ~52%. Canonical evaluation uses min_occlude_rate=0.001.
-        self.min_occlude_rate = min_occlude_rate
         self.first_annotator_only = first_annotator_only if not benchmark_650 else True
         self.target_author = target_author
+        if benchmark_650:
+            # Canonical benchmark reported in Table 1 (650 objects from 200 images):
+            # In BSDS_amodal_test.json, filtering occlude_rate >= 0.141 isolates the
+            # canonical 650 occluded test objects. Setting --no_benchmark_650 evaluates
+            # all 963 objects with occlude_rate > 0.
+            self.min_occlude_rate = 0.141
+        else:
+            self.min_occlude_rate = min_occlude_rate
 
         if dummy_test:
             self._init_dummy_samples()
@@ -773,7 +778,7 @@ class BSDSADataset:
         elif ann_file and os.path.exists(ann_file):
             self._load_from_cocoa_json(ann_file, images_dir)
         elif auto_synth_ann and images_dir and os.path.exists(images_dir) and len(os.listdir(images_dir)) > 0:
-            target_ann = ann_file if ann_file else os.path.join(dataset_dir or "data/bsds", "annotations", "BSDS_amodal_test.json")
+            target_ann = ann_file if ann_file else os.path.join(dataset_dir or "data/bsds", "annotations", "BSDS_amodal_synth_test.json")
             self._generate_synthetic_bsds_annotations(images_dir, target_ann)
         else:
             raise FileNotFoundError(
@@ -1182,9 +1187,9 @@ def evaluate(
     ckpt_path: str,
     dataset: BSDSADataset,
     device: str = "cuda",
-    ddim_steps: int = 50,
-    n_samples: int = 1,
-    guidance_scale: float = 1.5,
+    ddim_steps: int = 200,
+    n_samples: int = 3,
+    guidance_scale: float = 2.0,
     precision: str = "autocast",
     half: bool = False,
     distance_threshold: Optional[float] = None,
@@ -1444,20 +1449,20 @@ def main():
     parser.add_argument(
         "--ddim_steps",
         type=int,
-        default=50,
-        help="Number of DDIM sampling steps (default: 50, use 200 for paper reproduction)",
+        default=200,
+        help="Number of DDIM sampling steps (default: 200 for full paper reproduction; use 50 for fast eval)",
     )
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=1,
-        help="Number of completion samples to generate per object (default: 1)",
+        default=3,
+        help="Number of completion samples per object (default: 3 with majority voting & Best-of-3 for Table 1)",
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
-        default=1.5,
-        help="Diffusion guidance scale / CFG (default: 1.5, author standard for amodal completion)",
+        default=2.0,
+        help="Diffusion guidance scale / CFG (default: 2.0, author standard in inference.py)",
     )
     parser.add_argument(
         "--precision",

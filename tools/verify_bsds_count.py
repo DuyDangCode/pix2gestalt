@@ -324,7 +324,7 @@ def main():
         run_synthetic_test()
         return
 
-    if args.artificial_650_filter:
+    if args.artificial_650_filter or args.benchmark_650:
         min_occ = 0.141
     else:
         min_occ = args.min_occlude_rate
